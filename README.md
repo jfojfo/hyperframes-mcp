@@ -111,12 +111,12 @@ MCP tool calls carry text only: `project_write_file` / `project_read_file` handl
 | Route | Purpose |
 | --- | --- |
 | `PUT /files/<project>/<path>` | Upload one file; the body is the raw bytes. Parent directories are created. Returns `201` (new) or `200` (replaced) with `{ path, size, sha256, url }`. |
-| `POST /archives/<project>[/<dir>]` | Upload a `tar` / `tar.gz` (also bz2/xz) and extract it into the project or `<dir>`. Returns every written file with `size`, `sha256` and `url`. |
+| `POST /archives/<project>[/<dir>]` | Upload a `tar` or gzip-compressed `tar.gz` and extract it into the project or `<dir>`. Returns every written file with `size`, `sha256` and `url`. |
 | `GET` / `HEAD /artifacts/<project>/<file>` | Download. Supports single `Range` requests (`206` / `416`), `ETag` / `If-Range`, and UTF-8 filenames. |
 
 Optional request headers for uploads: `X-Content-SHA256: <hex>` rejects the upload with `422` if the received bytes differ, and `If-None-Match: *` refuses to overwrite existing files (`412`). Oversized uploads get `413`. Uploads are written to a temporary file and renamed into place, so a failed or rejected upload never leaves a partial file.
 
-Archives are checked before extraction and again after it. Only regular files and directories are accepted: symlinks, hard links, devices, absolute paths and `..` paths cause the whole archive to be rejected (`400`) with nothing written. Total extracted size and entry count are limited.
+Archives are read with the bundled `tar` npm package, so behaviour is identical on Linux and macOS and no system `tar` is needed. They are checked before extraction and again after it. Only regular files and directories are accepted: symlinks, hard links, devices, absolute paths and `..` paths cause the whole archive to be rejected (`400`) with nothing written. Total extracted size and entry count are limited (`413`), checked from the headers before anything is written.
 
 ```bash
 BASE=http://<host>:9006

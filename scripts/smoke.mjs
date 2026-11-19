@@ -6,6 +6,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import * as tar from 'tar';
 
 // Exercises the real HTTP MCP transport and real HyperFrames/Chrome/FFmpeg.
 // Preserves media and a machine-readable report under workspace/verification.
@@ -18,12 +19,13 @@ const port = socket.address().port;
 await new Promise(resolve => socket.close(resolve));
 const project = `smoke-${Date.now()}`;
 const UPLOAD_LIMIT = 4 * 1024 * 1024;
+const EXTRACT_LIMIT = 2 * 1024 * 1024;
 const base = `http://127.0.0.1:${port}`;
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const child = spawn(process.execPath, ['src/server.js'], {
   cwd: root,
   env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), HF_WORKSPACE: workspace,
-    HYPERFRAMES_NO_UPDATE_CHECK: '1', DO_NOT_TRACK: '1', HF_MAX_UPLOAD_BYTES: String(UPLOAD_LIMIT),
+    HYPERFRAMES_NO_UPDATE_CHECK: '1', DO_NOT_TRACK: '1', HF_MAX_UPLOAD_BYTES: String(UPLOAD_LIMIT), HF_MAX_EXTRACT_BYTES: String(EXTRACT_LIMIT),
     ...(process.platform === 'darwin' && !process.env.PUPPETEER_EXECUTABLE_PATH ? { PUPPETEER_EXECUTABLE_PATH: chrome } : {}),
   }, stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -140,7 +142,9 @@ async function binaryTransferChecks() {
   await fs.mkdir(path.join(src, 'pack/sub'), { recursive: true }); await fs.mkdir(path.join(src, 'pack/empty'));
   await fs.writeFile(path.join(src, 'pack/a.txt'), 'hello');
   await fs.writeFile(path.join(src, 'pack/sub/b.bin'), data);
-  execFileSync('tar', ['-czf', path.join(src, 'good.tgz'), '-C', path.join(src, 'pack'), '.']);
+  // Archives are built with node-tar so the test runs unchanged on Linux and macOS.
+  const pack = path.join(src, 'pack');
+  await tar.c({ gzip: true, file: path.join(src, 'good.tgz'), cwd: pack }, ['.']);
   r = await http('POST', `/archives/${project}/imported`, await fs.readFile(path.join(src, 'good.tgz')));
   assert.equal(r.status, 201, r.body.toString());
   json = JSON.parse(r.body);
@@ -149,17 +153,49 @@ async function binaryTransferChecks() {
   assert.deepEqual(await fs.readFile(path.join(dir, 'imported/sub/b.bin')), data);
   assert.ok((await fs.stat(path.join(dir, 'imported/empty'))).isDirectory());
   assert.equal((await http('POST', `/archives/${project}/imported`, await fs.readFile(path.join(src, 'good.tgz')), { 'if-none-match': '*' })).status, 412);
-  await fs.symlink('/etc/passwd', path.join(src, 'pack/evil-link'));
-  execFileSync('tar', ['-czf', path.join(src, 'link.tgz'), '-C', path.join(src, 'pack'), '.']);
-  assert.equal((await http('POST', `/archives/${project}/evil1`, await fs.readFile(path.join(src, 'link.tgz')))).status, 400);
-  execFileSync('tar', ['-cf', path.join(src, 'dotdot.tar'), '-P', '-C', path.join(src, 'pack'), '--transform', 's,^,../,', 'a.txt']);
-  assert.match(execFileSync('tar', ['-tf', path.join(src, 'dotdot.tar')], { encoding: 'utf8' }), /^\.\.\/a\.txt/);
-  assert.equal((await http('POST', `/archives/${project}/evil2`, await fs.readFile(path.join(src, 'dotdot.tar')))).status, 400);
-  assert.equal((await http('POST', `/archives/${project}`, Buffer.from('not a tar archive'))).status, 400);
-  assert.ok(!existsSync(path.join(dir, 'evil1')) && !existsSync(path.join(dir, 'evil2')) && !existsSync(path.join(workspace, 'a.txt')));
+  // Archives produced by whichever system tar tools exist (GNU tar on Linux, bsdtar on macOS) must also import.
+  const systemTars = ['tar', 'bsdtar', 'gtar'].filter(bin => { try { execFileSync(bin, ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } });
+  for (const bin of systemTars) {
+    const archive = path.join(src, `${bin}.tgz`);
+    execFileSync(bin, ['-czf', archive, '-C', pack, '.']);
+    r = await http('POST', `/archives/${project}/from-${bin}`, await fs.readFile(archive));
+    assert.equal(r.status, 201, `${bin}: ${r.body}`);
+    assert.deepEqual(await fs.readFile(path.join(dir, `from-${bin}/sub/b.bin`)), data);
+  }
+  report.archiveSystemTars = systemTars;
+
+  const rejected = async (label, archive, status = 400) => {
+    const result = await http('POST', `/archives/${project}/${label}`, archive);
+    assert.equal(result.status, status, `${label}: ${result.body}`);
+    assert.ok(!existsSync(path.join(dir, label)), label);
+  };
+  const evil = path.join(src, 'evil');
+  await fs.mkdir(evil);
+  await fs.writeFile(path.join(evil, 'ok.txt'), 'fine');
+  await fs.symlink('/etc/passwd', path.join(evil, 'link'));
+  await tar.c({ gzip: true, file: path.join(src, 'link.tgz'), cwd: evil }, ['ok.txt', 'link']);
+  await rejected('evil-symlink', await fs.readFile(path.join(src, 'link.tgz')));
+  await fs.rm(path.join(evil, 'link'));
+  await fs.link(path.join(evil, 'ok.txt'), path.join(evil, 'hard.txt'));
+  await tar.c({ file: path.join(src, 'hard.tar'), cwd: evil }, ['ok.txt', 'hard.txt']);
+  const hardTypes = [];
+  await tar.t({ file: path.join(src, 'hard.tar'), onReadEntry: entry => hardTypes.push(entry.type) });
+  assert.ok(hardTypes.includes('Link'), hardTypes.join());
+  await rejected('evil-hardlink', await fs.readFile(path.join(src, 'hard.tar')));
+  await tar.c({ file: path.join(src, 'dotdot.tar'), cwd: path.join(pack, 'sub'), preservePaths: true }, ['../a.txt']);
+  const dotdotPaths = [];
+  await tar.t({ file: path.join(src, 'dotdot.tar'), onReadEntry: entry => dotdotPaths.push(entry.path) });
+  assert.deepEqual(dotdotPaths, ['../a.txt']);
+  await rejected('evil-dotdot', await fs.readFile(path.join(src, 'dotdot.tar')));
+  await fs.writeFile(path.join(evil, 'bomb.bin'), Buffer.alloc(EXTRACT_LIMIT + 1));
+  await tar.c({ gzip: true, file: path.join(src, 'bomb.tgz'), cwd: evil }, ['bomb.bin']);
+  assert.ok((await fs.stat(path.join(src, 'bomb.tgz'))).size < 64 * 1024);
+  await rejected('evil-bomb', await fs.readFile(path.join(src, 'bomb.tgz')), 413);
+  await rejected('garbage', Buffer.from('not a tar archive'));
+  assert.ok(!existsSync(path.join(workspace, 'a.txt')) && !existsSync(path.join(dir, '..', 'a.txt')));
   assert.deepEqual(await fs.readdir(path.join(workspace, '.staging')), []);
   await fs.rm(src, { recursive: true, force: true });
-  check('POST /archives extracts tar.gz; symlink, ../ and garbage archives rejected; staging cleaned');
+  check(`POST /archives: node-tar + ${systemTars.join("/") || "no system"} tar archives import; symlink, hardlink, ../, oversize and garbage rejected; staging cleaned`);
 }
 try {
   let health;

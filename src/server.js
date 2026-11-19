@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+import * as tar from 'tar';
 import * as z from 'zod/v4';
 
 const execFileAsync = promisify(execFile);
@@ -457,11 +458,31 @@ async function handleFileUpload(req, res, url) {
   }
 }
 
-async function tarList(archive, verbose) {
+const ARCHIVE_FILE_TYPES = new Set(['File', 'OldFile', 'ContiguousFile']);
+function archiveError(error) {
+  return error.status ? error : httpError(400, `Not a valid tar/tar.gz archive: ${error.message}`);
+}
+// Read the archive headers with node-tar (same behaviour on Linux and macOS, no system tar needed) and
+// reject the whole archive unless every entry is a regular file or directory with a safe relative path.
+async function vetArchive(archive) {
+  let entries = 0, total = 0, files = 0, problem;
   try {
-    const { stdout } = await execFileAsync('tar', [verbose ? '-tvf' : '-tf', archive, '--quoting-style=escape'], { maxBuffer: 64 * 1024 * 1024, timeout: COMMAND_TIMEOUT });
-    return stdout.split('\n').filter(Boolean);
-  } catch (error) { throw httpError(400, `Not a readable tar archive: ${errorText(error).slice(0, 500)}`); }
+    await tar.t({
+      file: archive, strict: true,
+      onReadEntry(entry) {
+        if (problem) return;
+        entries++;
+        const name = entry.path;
+        if (/^([\\/]|[A-Za-z]:)/.test(name) || name.split(/[\\/]/).includes('..')) problem = httpError(400, `Unsafe archive path: ${name}`);
+        else if (ARCHIVE_FILE_TYPES.has(entry.type)) { files++; total += entry.size; }
+        else if (entry.type !== 'Directory') problem = httpError(400, `Archive entry ${name} is a ${entry.type}; only regular files and directories are accepted.`);
+        if (!problem && entries > MAX_ARCHIVE_ENTRIES) problem = httpError(413, `Archive has more than ${MAX_ARCHIVE_ENTRIES} entries (HF_MAX_ARCHIVE_ENTRIES).`);
+        if (!problem && total > MAX_EXTRACT_BYTES) problem = httpError(413, `Archive expands to more than ${MAX_EXTRACT_BYTES} bytes (HF_MAX_EXTRACT_BYTES).`);
+      },
+    });
+  } catch (error) { throw archiveError(error); }
+  if (problem) throw problem;
+  if (!files) throw httpError(400, 'Archive contains no files.');
 }
 // Walk extracted files with lstat: only plain directories and single-link regular files are accepted.
 async function collectExtracted(dir, base = dir, out = { files: [], dirs: [] }) {
@@ -474,7 +495,7 @@ async function collectExtracted(dir, base = dir, out = { files: [], dirs: [] }) 
   return out;
 }
 
-// POST /archives/<project>[/<dir>]: tar or tar.gz/.bz2/.xz body, extracted into the project (or a subdirectory).
+// POST /archives/<project>[/<dir>]: tar or gzip-compressed tar body, extracted into the project (or a subdirectory).
 async function handleArchiveUpload(req, res, url) {
   const [project, ...rest] = pathSegments(url.pathname, '/archives/');
   if (!project) throw httpError(400, 'Usage: POST /archives/<project>[/<dir>] with a tar or tar.gz body.');
@@ -488,22 +509,16 @@ async function handleArchiveUpload(req, res, url) {
     await fs.mkdir(extracted);
     const received = await receiveUpload(req, archive);
 
-    // Vet the listing before anything is written to disk.
-    const names = await tarList(archive, false), details = await tarList(archive, true);
-    if (names.length !== details.length) throw httpError(400, 'Could not read the archive listing unambiguously.');
-    if (names.length > MAX_ARCHIVE_ENTRIES) throw httpError(413, `Archive has ${names.length} entries; limit is ${MAX_ARCHIVE_ENTRIES}.`);
-    let total = 0;
-    for (const [index, name] of names.entries()) {
-      if (name.startsWith('/') || name.split('/').includes('..')) throw httpError(400, `Unsafe archive path: ${name}`);
-      const match = /^([-d])\S*\s+\S+\s+(\d+)\s/.exec(details[index]);
-      if (!match) throw httpError(400, `Archive entry ${name} is not a regular file or directory.`);
-      total += Number(match[2]);
-    }
-    if (total > MAX_EXTRACT_BYTES) throw httpError(413, `Archive expands to ${total} bytes; limit is ${MAX_EXTRACT_BYTES} (HF_MAX_EXTRACT_BYTES).`);
-
+    // Vet every header before anything is written to disk.
+    await vetArchive(archive);
     try {
-      await execFileAsync('tar', ['-xf', archive, '-C', extracted, '--no-same-owner', '--no-same-permissions'], { maxBuffer: MAX_OUTPUT, timeout: COMMAND_TIMEOUT });
-    } catch (error) { throw httpError(400, `Extraction failed: ${errorText(error).slice(0, 500)}`); }
+      // The filter repeats the type check as defence in depth; node-tar itself also refuses absolute and .. paths.
+      await tar.x({
+        file: archive, cwd: extracted, strict: true, preserveOwner: false, noChmod: true,
+        filter: (_path, entry) => entry.type === 'Directory' || ARCHIVE_FILE_TYPES.has(entry.type),
+      });
+    } catch (error) { throw archiveError(error); }
+    // Post-extraction lstat walk: anything that is not a plain file or directory still rejects the archive.
     const { files, dirs } = await collectExtracted(extracted);
 
     const plan = files.sort().map(file => {

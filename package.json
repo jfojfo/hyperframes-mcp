@@ -17,6 +17,7 @@
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "hyperframes": "0.9.43",
+    "tar": "7.5.23",
     "zod": "4.4.3"
   }
 }
