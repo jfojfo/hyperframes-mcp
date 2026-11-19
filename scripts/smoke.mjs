@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { promises as fs, existsSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,12 +17,13 @@ await new Promise(resolve => socket.listen(0, '127.0.0.1', resolve));
 const port = socket.address().port;
 await new Promise(resolve => socket.close(resolve));
 const project = `smoke-${Date.now()}`;
+const UPLOAD_LIMIT = 4 * 1024 * 1024;
 const base = `http://127.0.0.1:${port}`;
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const child = spawn(process.execPath, ['src/server.js'], {
   cwd: root,
   env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), HF_WORKSPACE: workspace,
-    HYPERFRAMES_NO_UPDATE_CHECK: '1', DO_NOT_TRACK: '1',
+    HYPERFRAMES_NO_UPDATE_CHECK: '1', DO_NOT_TRACK: '1', HF_MAX_UPLOAD_BYTES: String(UPLOAD_LIMIT),
     ...(process.platform === 'darwin' && !process.env.PUPPETEER_EXECUTABLE_PATH ? { PUPPETEER_EXECUTABLE_PATH: chrome } : {}),
   }, stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -53,6 +55,112 @@ async function call(name, args = {}, expectedError = false) {
   console.log(`PASS ${name}${expectedError ? ' (expected error)' : ''}`);
   return result.content.filter(item => item.type === 'text').map(item => item.text).join('\n');
 }
+const sha256 = data => createHash('sha256').update(data).digest('hex');
+async function http(method, file, body, headers = {}) {
+  const response = await fetch(`${base}${file}`, { method, body, headers, ...(body?.getReader ? { duplex: 'half' } : {}) });
+  return { status: response.status, headers: response.headers, body: Buffer.from(await response.arrayBuffer()) };
+}
+function check(name) { report.checks.push(name); console.log(`PASS ${name}`); }
+async function binaryTransferChecks() {
+  const dir = path.join(workspace, project);
+  // Every byte value, so any text/encoding mangling shows up.
+  const data = Buffer.concat([Buffer.from(Array.from({ length: 256 }, (_, i) => i)), randomBytes(300_000)]);
+  const name = 'assets/bin/sample data ü.bin', urlPath = name.split('/').map(encodeURIComponent).join('/');
+  let r = await http('PUT', `/files/${project}/${urlPath}`, data);
+  assert.equal(r.status, 201, r.body.toString());
+  let json = JSON.parse(r.body);
+  assert.equal(json.size, data.length); assert.equal(json.sha256, sha256(data)); assert.equal(json.path, name);
+  assert.deepEqual(await fs.readFile(path.join(dir, name)), data);
+  assert.equal(json.url, `${base}/artifacts/${project}/${urlPath}`);
+  check('PUT /files binary upload, byte-exact with sha256');
+
+  assert.equal((await http('PUT', `/files/${project}/${urlPath}`, Buffer.from('x'), { 'if-none-match': '*' })).status, 412);
+  assert.equal((await http('PUT', `/files/${project}/${urlPath}`, Buffer.from('x'), { 'x-content-sha256': sha256(Buffer.from('y')) })).status, 422);
+  assert.deepEqual(await fs.readFile(path.join(dir, name)), data);
+  r = await http('PUT', `/files/${project}/${urlPath}`, data, { 'x-content-sha256': sha256(data) });
+  assert.equal(r.status, 200); assert.equal(JSON.parse(r.body).replaced, true);
+  assert.equal((await http('PUT', `/files/${project}/assets`, data)).status, 409);
+  assert.equal((await http('PUT', `/files/no-such-project/a.bin`, data)).status, 404);
+  assert.equal((await http('PUT', `/files/${project}/..%2Fescape.bin`, data)).status, 400);
+  assert.equal((await http('PUT', `/files/${project}/%E0%A4%A`, data)).status, 400);
+  assert.equal((await http('GET', `/files/${project}/a.bin`)).status, 405);
+  check('upload preconditions, sha256 mismatch, conflicts and bad paths rejected; file untouched');
+
+  r = await http('PUT', `/files/${project}/too-big.bin`, Buffer.alloc(UPLOAD_LIMIT + 1));
+  assert.equal(r.status, 413);
+  const chunks = [Buffer.alloc(UPLOAD_LIMIT), Buffer.alloc(1024)];
+  const stream = new ReadableStream({ pull(controller) { const chunk = chunks.shift(); chunk ? controller.enqueue(chunk) : controller.close(); } });
+  r = await http('PUT', `/files/${project}/too-big.bin`, stream);
+  assert.equal(r.status, 413);
+  assert.ok(!(await fs.readdir(dir)).some(file => file.includes('too-big')));
+  check('413 for declared and chunked oversize uploads, no partial file left');
+
+  const artifact = `/artifacts/${project}/${urlPath}`;
+  r = await http('GET', artifact);
+  assert.equal(r.status, 200); assert.deepEqual(r.body, data);
+  assert.equal(r.headers.get('accept-ranges'), 'bytes');
+  assert.match(r.headers.get('content-disposition'), /filename\*=UTF-8''sample%20data%20%C3%BC\.bin/);
+  const etag = r.headers.get('etag');
+  r = await http('HEAD', artifact);
+  assert.equal(r.status, 200); assert.equal(r.headers.get('content-length'), String(data.length)); assert.equal(r.body.length, 0);
+  r = await http('GET', artifact, undefined, { range: 'bytes=100-199' });
+  assert.equal(r.status, 206); assert.equal(r.headers.get('content-range'), `bytes 100-199/${data.length}`); assert.deepEqual(r.body, data.subarray(100, 200));
+  r = await http('GET', artifact, undefined, { range: 'bytes=-10' });
+  assert.equal(r.status, 206); assert.deepEqual(r.body, data.subarray(-10));
+  r = await http('GET', artifact, undefined, { range: `bytes=${data.length - 5}-` });
+  assert.equal(r.status, 206); assert.deepEqual(r.body, data.subarray(-5));
+  r = await http('GET', artifact, undefined, { range: `bytes=${data.length}-` });
+  assert.equal(r.status, 416); assert.equal(r.headers.get('content-range'), `bytes */${data.length}`);
+  r = await http('GET', artifact, undefined, { range: 'bytes=0-9', 'if-range': etag });
+  assert.equal(r.status, 206);
+  r = await http('GET', artifact, undefined, { range: 'bytes=0-9', 'if-range': '"stale"' });
+  assert.equal(r.status, 200); assert.equal(r.body.length, data.length);
+  assert.equal((await http('POST', artifact)).status, 405);
+  check('GET/HEAD /artifacts with Range, suffix/open ranges, 416, If-Range, UTF-8 filename');
+
+  // Symlinks pointing out of the project must not be readable or writable through it.
+  const outside = path.join(workspace, `${project}-outside`);
+  await fs.mkdir(outside, { recursive: true });
+  await fs.writeFile(path.join(outside, 'secret.txt'), 'secret');
+  await fs.symlink(path.join(outside, 'secret.txt'), path.join(dir, 'leak.txt'));
+  await fs.symlink(outside, path.join(dir, 'linkdir'));
+  assert.equal((await http('GET', `/artifacts/${project}/leak.txt`)).status, 404);
+  assert.equal((await http('GET', `/artifacts/${project}/linkdir/secret.txt`)).status, 404);
+  assert.equal((await http('PUT', `/files/${project}/linkdir/planted.bin`, data)).status, 403);
+  assert.ok(!existsSync(path.join(outside, 'planted.bin')));
+  await call('project_read_file', { project, file: 'leak.txt' }, true);
+  await call('project_write_file', { project, file: 'linkdir/planted.txt', content: 'x' }, true);
+  assert.ok(!existsSync(path.join(outside, 'planted.txt')));
+  await fs.rm(path.join(dir, 'leak.txt')); await fs.rm(path.join(dir, 'linkdir'));
+  check('symlink escapes blocked for download, upload and file tools');
+  assert.match(await call('project_read_file', { project, file: name }, true), /Binary file .*\/artifacts\//);
+
+  // Archive upload: nested files + empty dir; then malicious archives must leave the project untouched.
+  const src = await fs.mkdtemp(path.join(tmpdir(), 'hf-smoke-archive-'));
+  await fs.mkdir(path.join(src, 'pack/sub'), { recursive: true }); await fs.mkdir(path.join(src, 'pack/empty'));
+  await fs.writeFile(path.join(src, 'pack/a.txt'), 'hello');
+  await fs.writeFile(path.join(src, 'pack/sub/b.bin'), data);
+  execFileSync('tar', ['-czf', path.join(src, 'good.tgz'), '-C', path.join(src, 'pack'), '.']);
+  r = await http('POST', `/archives/${project}/imported`, await fs.readFile(path.join(src, 'good.tgz')));
+  assert.equal(r.status, 201, r.body.toString());
+  json = JSON.parse(r.body);
+  assert.deepEqual(json.files.map(item => item.path).sort(), ['imported/a.txt', 'imported/sub/b.bin']);
+  assert.equal(json.files.find(item => item.path === 'imported/sub/b.bin').sha256, sha256(data));
+  assert.deepEqual(await fs.readFile(path.join(dir, 'imported/sub/b.bin')), data);
+  assert.ok((await fs.stat(path.join(dir, 'imported/empty'))).isDirectory());
+  assert.equal((await http('POST', `/archives/${project}/imported`, await fs.readFile(path.join(src, 'good.tgz')), { 'if-none-match': '*' })).status, 412);
+  await fs.symlink('/etc/passwd', path.join(src, 'pack/evil-link'));
+  execFileSync('tar', ['-czf', path.join(src, 'link.tgz'), '-C', path.join(src, 'pack'), '.']);
+  assert.equal((await http('POST', `/archives/${project}/evil1`, await fs.readFile(path.join(src, 'link.tgz')))).status, 400);
+  execFileSync('tar', ['-cf', path.join(src, 'dotdot.tar'), '-P', '-C', path.join(src, 'pack'), '--transform', 's,^,../,', 'a.txt']);
+  assert.match(execFileSync('tar', ['-tf', path.join(src, 'dotdot.tar')], { encoding: 'utf8' }), /^\.\.\/a\.txt/);
+  assert.equal((await http('POST', `/archives/${project}/evil2`, await fs.readFile(path.join(src, 'dotdot.tar')))).status, 400);
+  assert.equal((await http('POST', `/archives/${project}`, Buffer.from('not a tar archive'))).status, 400);
+  assert.ok(!existsSync(path.join(dir, 'evil1')) && !existsSync(path.join(dir, 'evil2')) && !existsSync(path.join(workspace, 'a.txt')));
+  assert.deepEqual(await fs.readdir(path.join(workspace, '.staging')), []);
+  await fs.rm(src, { recursive: true, force: true });
+  check('POST /archives extracts tar.gz; symlink, ../ and garbage archives rejected; staging cleaned');
+}
 try {
   let health;
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -69,6 +177,7 @@ try {
   assert.equal((await call('hyperframes_version')).trim(), '0.9.43');
   await call('hyperframes_init', { name: project, fps: 24 });
   assert.match(await fs.readFile(path.join(workspace, project, 'index.html'), 'utf8'), /data-fps="24"/);
+  await binaryTransferChecks();
   // Use a tiny, self-contained animated composition, with no CDN or model dependency.
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
     *{box-sizing:border-box}html,body{margin:0;width:320px;height:180px;overflow:hidden;background:#102030}
@@ -98,6 +207,14 @@ try {
   assert.equal(stream.avg_frame_rate, '24/1');
   execFileSync('ffmpeg', ['-v', 'error', '-i', video, '-f', 'null', '-'], { stdio: 'pipe' });
   report.media = probe;
+  const renderResult = report.responses.hyperframes_render.at(-1);
+  const { artifacts } = JSON.parse(renderResult.content[1].text);
+  const reported = artifacts.find(item => item.path === 'renders/smoke.mp4');
+  assert.ok(reported, renderResult.content[1].text);
+  assert.equal(reported.sha256, sha256(await fs.readFile(video)));
+  assert.equal(reported.url, `${base}/artifacts/${project}/renders/smoke.mp4`);
+  assert.equal((await fetch(reported.url, { method: 'HEAD' })).headers.get('content-length'), String(reported.size));
+  report.checks.push('render reports artifact url + size + sha256');
   const artifact = await fetch(`${base}/artifacts/${project}/renders/smoke.mp4`);
   assert.equal(artifact.status, 200); assert.equal(artifact.headers.get('content-type'), 'video/mp4');
   assert.deepEqual(Buffer.from(await artifact.arrayBuffer()), await fs.readFile(video));

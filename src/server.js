@@ -1,7 +1,9 @@
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { promises as fs, createReadStream, existsSync } from 'node:fs';
+import { promises as fs, createReadStream, createWriteStream, existsSync, realpathSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,18 +25,80 @@ const fpsSchema = z.union([z.number().int().min(1).max(240), z.string().regex(/^
 const timesSchema = z.array(z.number().nonnegative()).min(1).max(100);
 const CLI_COMMANDS = ['doctor', 'init', 'info', 'lint', 'validate', 'check', 'preview', 'render', 'compositions', 'catalog', 'add', 'transcribe', 'tts', 'upgrade', 'docs', 'snapshot', 'timeline', 'audio', 'normalize-audio', 'beats', 'inspect', 'keyframes', 'layout', 'measure', 'diff', 'compare', 'grade-compare', 'media-treatment', 'media-use', 'remove-background', 'capture', 'history'];
 
-await fs.mkdir(ROOT, { recursive: true });
+const MAX_UPLOAD_BYTES = Number(process.env.HF_MAX_UPLOAD_BYTES || 1024 ** 3);
+const MAX_EXTRACT_BYTES = Number(process.env.HF_MAX_EXTRACT_BYTES || 2 * 1024 ** 3);
+const MAX_ARCHIVE_ENTRIES = Number(process.env.HF_MAX_ARCHIVE_ENTRIES || 10000);
+const MAX_LISTED_OUTPUTS = 200;
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+// Project names must start with a letter or digit, so this directory can never be addressed as a project.
+const STAGING = path.join(ROOT, '.staging');
 
+await fs.mkdir(ROOT, { recursive: true });
+await fs.rm(STAGING, { recursive: true, force: true });
+await fs.mkdir(STAGING, { recursive: true });
+
+function httpError(status, message) { return Object.assign(new Error(message), { status }); }
+function isInside(base, target) { return target === base || target.startsWith(base + path.sep); }
+// Resolve symlinks for the longest existing prefix; the missing tail is appended unchanged.
+function realpathNearest(target) {
+  const rest = [];
+  for (let current = target; ;) {
+    try { return path.join(realpathSync(current), ...rest); } catch (error) {
+      const parent = path.dirname(current);
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code) || parent === current) throw error;
+      rest.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
 function projectPath(name) {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$/.test(name)) throw new Error('Invalid project name. Use letters, numbers, dot, dash, or underscore only.');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$/.test(name)) throw httpError(400, 'Invalid project name. Use letters, numbers, dot, dash, or underscore only.');
   const resolved = path.resolve(ROOT, name);
-  if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) throw new Error('Project path escapes workspace.');
+  if (!isInside(ROOT, resolved) || !isInside(realpathNearest(ROOT), realpathNearest(resolved))) throw httpError(403, 'Project path escapes workspace.');
   return resolved;
 }
 function relativeSafe(projectDir, filePath) {
   const resolved = path.resolve(projectDir, filePath);
-  if (resolved !== projectDir && !resolved.startsWith(projectDir + path.sep)) throw new Error('File path escapes the project directory.');
+  if (!isInside(projectDir, resolved) || !isInside(realpathNearest(projectDir), realpathNearest(resolved))) {
+    throw httpError(403, 'File path escapes the project directory.');
+  }
   return resolved;
+}
+async function existingProject(name) {
+  const cwd = projectPath(name);
+  const stat = await fs.stat(cwd).catch(() => null);
+  if (!stat?.isDirectory()) throw httpError(404, `Project "${name}" not found. Create it with hyperframes_init first.`);
+  return cwd;
+}
+async function listFiles(dir, base = dir) {
+  const files = [];
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    if (['node_modules', '.git'].includes(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...await listFiles(full, base));
+    else files.push(path.relative(base, full));
+  }
+  return files;
+}
+async function hashFile(file) {
+  const hash = createHash('sha256');
+  await pipeline(createReadStream(file), hash);
+  return hash.digest('hex');
+}
+function toPosix(relative) { return relative.split(path.sep).join('/'); }
+function artifactUrl(origin, project, relative) {
+  return `${origin}/artifacts/${[project, ...toPosix(relative).split('/')].map(encodeURIComponent).join('/')}`;
+}
+async function describeFile(origin, project, cwd, file) {
+  const stat = await fs.stat(file);
+  const relative = toPosix(path.relative(cwd, file));
+  return { path: relative, size: stat.size, sha256: await hashFile(file), url: artifactUrl(origin, project, relative) };
+}
+function forwardedOrigin(getHeader, fallbackProto, fallbackHost) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const first = value => value?.split(',')[0].trim() || undefined;
+  const host = first(getHeader('x-forwarded-host')) || getHeader('host') || fallbackHost;
+  return host ? `${first(getHeader('x-forwarded-proto')) || fallbackProto}://${host}` : '';
 }
 function contentTypeFor(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -81,17 +145,39 @@ function appendOptions(args, values, mapping) {
   }
   return args;
 }
-function registerCliTool(server, name, description, schema, buildArgs) {
+function registerCliTool(server, name, description, schema, buildArgs, describeResult) {
   server.registerTool(name, { description, inputSchema: schema }, async input => {
     try {
       const cwd = input.project ? projectPath(input.project) : ROOT;
+      const startedAt = Date.now();
       const result = await runHyperframes(buildArgs(input, cwd), cwd);
-      return textResult(result.stdout || result.stderr || 'Command completed.');
+      const text = result.stdout || result.stderr || 'Command completed.';
+      if (!describeResult) return textResult(text);
+      let extra;
+      try { extra = await describeResult(input, cwd, startedAt); } catch (error) { extra = { describeError: errorText(error) }; }
+      // Separate content item, so CLI --json output stays parseable on its own.
+      return { content: [{ type: 'text', text }, { type: 'text', text: JSON.stringify(extra, null, 2) }] };
     } catch (error) { return errorResult(error); }
   });
 }
+// Files written by this render: the explicit output (file or directory), else new files under renders/.
+async function describeRenderOutputs(origin, project, cwd, output, startedAt) {
+  const target = relativeSafe(cwd, output || 'renders');
+  const stat = await fs.stat(target).catch(() => null);
+  if (!stat) return { artifacts: [] };
+  const candidates = stat.isFile() ? [target] : (await listFiles(target)).map(file => path.join(target, file));
+  const recent = [];
+  for (const file of candidates.sort()) {
+    const fileStat = await fs.stat(file).catch(() => null);
+    // 2s tolerance for coarse filesystem timestamps.
+    if (fileStat?.isFile() && (output || fileStat.mtimeMs >= startedAt - 2000)) recent.push(file);
+  }
+  const artifacts = [];
+  for (const file of recent.slice(0, MAX_LISTED_OUTPUTS)) artifacts.push(await describeFile(origin, project, cwd, file));
+  return { artifacts, ...(recent.length > MAX_LISTED_OUTPUTS ? { truncated: recent.length - MAX_LISTED_OUTPUTS } : {}) };
+}
 
-function registerTools(server) {
+function registerTools(server, origin = PUBLIC_BASE_URL) {
   server.registerTool('hyperframes_doctor', { title: 'HyperFrames Doctor', description: 'Check the HyperFrames, Node, FFmpeg and Chromium environment.', inputSchema: z.object({}) }, async () => { try { return textResult((await runHyperframes(['doctor'])).stdout); } catch (e) { return errorResult(e); } });
   registerCliTool(server, 'hyperframes_version', 'Report the actual CLI version running on the MCP host.', z.object({}), () => ['--version']);
   registerCliTool(server, 'hyperframes_check', 'Check lint, runtime, layout, motion and contrast in one browser session. Preferred over validate/inspect.', z.object({
@@ -205,7 +291,7 @@ function registerTools(server) {
     });
     if (input.variables) args.push('--variables', JSON.stringify(input.variables));
     return args;
-  });
+  }, (input, cwd, startedAt) => describeRenderOutputs(origin, input.project, cwd, input.output, startedAt));
   registerCliTool(server, 'hyperframes_transcribe', 'Transcribe on the MCP host or import SRT/VTT/JSON. Local engines only; may download speech models.', z.object({
     project: projectSchema, input: z.string().min(1), model: z.string().optional(),
     engine: z.enum(['auto', 'whisper', 'parakeet']).optional(), language: z.string().optional(), json: z.boolean().optional(),
@@ -225,80 +311,297 @@ function registerTools(server) {
   }), input => appendOptions(['catalog'], input, { type: 'type', query: 'query', tag: 'tag', json: 'json' }));
   server.registerTool('hyperframes_add', { title: 'Install Catalog Item', description: 'Install a HyperFrames catalog item.', inputSchema: z.object({ project: z.string().min(1), name: z.string().min(1).max(200) }) }, async ({ project, name }) => { try { return textResult((await runHyperframes(['add', name], projectPath(project))).stdout); } catch (e) { return errorResult(e); } });
   server.registerTool('hyperframes_docs', { title: 'HyperFrames Docs', description: 'Return HyperFrames CLI documentation.', inputSchema: z.object({ topic: z.string().min(1).max(100) }) }, async ({ topic }) => { try { return textResult((await runHyperframes(['docs', topic])).stdout); } catch (e) { return errorResult(e); } });
-  server.registerTool('project_list_files', { title: 'List Project Files', description: 'List project files, including rendered outputs and snapshots.', inputSchema: z.object({ project: z.string().min(1), subdir: z.string().optional() }) }, async ({ project, subdir }) => { try { const cwd = projectPath(project), start = subdir ? relativeSafe(cwd, subdir) : cwd, entries = []; async function walk(dir) { for (const entry of await fs.readdir(dir, { withFileTypes: true })) { if (['node_modules', '.git'].includes(entry.name)) continue; const full = path.join(dir, entry.name); if (entry.isDirectory()) await walk(full); else entries.push(path.relative(cwd, full)); } } await walk(start); return jsonResult(entries.sort()); } catch (e) { return errorResult(e); } });
-  server.registerTool('project_read_file', { title: 'Read Project File', description: 'Read a UTF-8 text file.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1) }) }, async ({ project, file }) => { try { const cwd = projectPath(project); return textResult(await fs.readFile(relativeSafe(cwd, file), 'utf8')); } catch (e) { return errorResult(e); } });
-  server.registerTool('project_write_file', { title: 'Write Project File', description: 'Create or replace a UTF-8 text file.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1), content: z.string().max(2_000_000) }) }, async ({ project, file, content }) => { try { const cwd = projectPath(project), target = relativeSafe(cwd, file); await fs.mkdir(path.dirname(target), { recursive: true }); await fs.writeFile(target, content, 'utf8'); return textResult(`Wrote ${path.relative(cwd, target)} (${content.length} characters).`); } catch (e) { return errorResult(e); } });
+  server.registerTool('project_list_files', { title: 'List Project Files', description: 'List project files, including rendered outputs and snapshots.', inputSchema: z.object({ project: z.string().min(1), subdir: z.string().optional() }) }, async ({ project, subdir }) => {
+    try {
+      const cwd = projectPath(project), start = subdir ? relativeSafe(cwd, subdir) : cwd;
+      return jsonResult((await listFiles(start)).map(file => path.relative(cwd, path.join(start, file))).sort());
+    } catch (e) { return errorResult(e); }
+  });
+  server.registerTool('project_read_file', { title: 'Read Project File', description: 'Read a UTF-8 text file. Binary files are refused; download them over HTTP from the returned URL.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1) }) }, async ({ project, file }) => {
+    try {
+      const cwd = projectPath(project), target = relativeSafe(cwd, file), data = await fs.readFile(target);
+      if (data.includes(0)) throw new Error(`Binary file (${data.length} bytes). Download it from ${artifactUrl(origin, project, path.relative(cwd, target))}`);
+      return textResult(data.toString('utf8'));
+    } catch (e) { return errorResult(e); }
+  });
+  server.registerTool('project_write_file', { title: 'Write Project File', description: 'Create or replace a UTF-8 text file. For binary assets (images, audio, video, fonts) the client uploads over HTTP instead: PUT /files/<project>/<path> with the raw bytes, or POST /archives/<project>[/<dir>] with a tar/tar.gz.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1), content: z.string().max(2_000_000) }) }, async ({ project, file, content }) => { try { const cwd = projectPath(project), target = relativeSafe(cwd, file); await fs.mkdir(path.dirname(target), { recursive: true }); await fs.writeFile(target, content, 'utf8'); return textResult(`Wrote ${path.relative(cwd, target)} (${content.length} characters).`); } catch (e) { return errorResult(e); } });
   registerCliTool(server, 'hyperframes_cli', 'Advanced allowlisted CLI on the MCP host, with unrestricted CLI arguments (trusted LAN clients only). Official cloud, publishing and account commands are excluded.', z.object({
     command: z.enum(CLI_COMMANDS), project: projectSchema.optional(), args: z.array(z.string()).max(60).optional(),
   }), ({ command, args = [] }) => [command, ...args]);
 }
 
-function buildServer() {
-  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. After rendering, download videos from /artifacts/<project>/<file>.' });
-  registerTools(server); return server;
+function buildServer(ctx = {}) {
+  const request = ctx.requestInfo;
+  let origin = PUBLIC_BASE_URL;
+  if (!origin && request) {
+    const url = new URL(request.url);
+    origin = forwardedOrigin(name => request.headers.get(name) ?? undefined, url.protocol.slice(0, -1), url.host);
+  }
+  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). hyperframes_render returns each output URL with size and sha256.' });
+  registerTools(server, origin); return server;
 }
 const handler = createMcpHandler(buildServer);
 const nodeHandler = toNodeHandler(handler);
+
+function send(res, status, body, headers = {}) {
+  const json = typeof body !== 'string';
+  const payload = json ? JSON.stringify(body, null, 2) + '\n' : body;
+  res.writeHead(status, { 'content-type': json ? 'application/json' : 'text/plain; charset=utf-8', 'content-length': Buffer.byteLength(payload), ...headers });
+  res.end(payload);
+}
+function requestOrigin(req) {
+  return forwardedOrigin(name => req.headers[name], req.socket.encrypted ? 'https' : 'http', 'localhost');
+}
+// Percent-decode each URL segment; a decoded segment may not smuggle in separators or dot segments.
+function pathSegments(pathname, prefix) {
+  return pathname.slice(prefix.length).split('/').filter(Boolean).map(segment => {
+    let decoded;
+    try { decoded = decodeURIComponent(segment); } catch { throw httpError(400, 'Malformed percent-encoding in path.'); }
+    if (decoded === '.' || decoded === '..' || /[\\/\0]/.test(decoded)) throw httpError(400, 'Invalid path segment.');
+    return decoded;
+  });
+}
+function contentDisposition(name) {
+  const fallback = name.replace(/[^\x20-\x7e]|["\\%]/g, '_');
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `inline; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+// Single byte range only. null = ignore the header (serve 200), false = unsatisfiable (416).
+function parseRange(header, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || (!match[1] && !match[2])) return null;
+  let start, end;
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    if (suffix === 0) return false;
+    start = Math.max(0, size - suffix); end = size - 1;
+  } else {
+    start = Number(match[1]);
+    if (match[2] && Number(match[2]) < start) return null;
+    end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+  }
+  return start >= size ? false : [start, end];
+}
+
+// Stream the request body to a new file, hashing as it goes. On overflow the rest of the body is drained
+// (not written), so the client still receives the 413 instead of a reset connection.
+function receiveToFile(req, file, limit) {
+  return new Promise((resolve, reject) => {
+    const out = createWriteStream(file, { flags: 'wx' });
+    const hash = createHash('sha256');
+    let size = 0, failed = false;
+    const fail = error => {
+      if (failed) return;
+      failed = true;
+      req.removeListener('data', onData);
+      req.resume();
+      out.destroy();
+      reject(error);
+    };
+    const onData = chunk => {
+      size += chunk.length;
+      if (size > limit) return fail(httpError(413, `Upload exceeds the ${limit}-byte limit (HF_MAX_UPLOAD_BYTES).`));
+      hash.update(chunk);
+      if (!out.write(chunk)) { req.pause(); out.once('drain', () => req.resume()); }
+    };
+    req.on('data', onData);
+    req.once('end', () => { if (!failed) out.end(); });
+    req.once('aborted', () => fail(httpError(400, 'Upload aborted by client.')));
+    req.once('error', fail);
+    out.once('error', fail);
+    out.once('finish', () => { if (!failed) resolve({ size, sha256: hash.digest('hex') }); });
+  });
+}
+async function receiveUpload(req, file) {
+  if (Number(req.headers['content-length']) > MAX_UPLOAD_BYTES) {
+    throw httpError(413, `Upload exceeds the ${MAX_UPLOAD_BYTES}-byte limit (HF_MAX_UPLOAD_BYTES).`);
+  }
+  const received = await receiveToFile(req, file, MAX_UPLOAD_BYTES);
+  const expected = req.headers['x-content-sha256'];
+  if (expected && expected.trim().toLowerCase() !== received.sha256) {
+    throw httpError(422, `sha256 mismatch: header ${expected.trim()}, received ${received.sha256}.`);
+  }
+  return received;
+}
+async function moveInto(source, target) {
+  try { await fs.rename(source, target); } catch (error) {
+    if (error.code !== 'EXDEV') throw error;
+    await fs.copyFile(source, target);
+    await fs.rm(source, { force: true });
+  }
+}
+async function assertWritableTarget(target, relative, noOverwrite) {
+  const existing = await fs.lstat(target).catch(() => null);
+  if (existing?.isDirectory()) throw httpError(409, `${relative} is an existing directory.`);
+  if (existing && noOverwrite) throw httpError(412, `${relative} already exists (If-None-Match: *).`);
+  return Boolean(existing);
+}
+
+// PUT /files/<project>/<path>: raw body, written to a temp file next to the target and renamed into place.
+async function handleFileUpload(req, res, url) {
+  const [project, ...rest] = pathSegments(url.pathname, '/files/');
+  if (!project || !rest.length) throw httpError(400, 'Usage: PUT /files/<project>/<path> with the raw file bytes as the body.');
+  const cwd = await existingProject(project);
+  const relative = rest.join('/');
+  const target = relativeSafe(cwd, relative);
+  const replaced = await assertWritableTarget(target, relative, req.headers['if-none-match'] === '*');
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  relativeSafe(cwd, relative);
+  const temp = path.join(path.dirname(target), `.${path.basename(target)}.${randomBytes(6).toString('hex')}.upload`);
+  try {
+    const { size, sha256 } = await receiveUpload(req, temp);
+    await fs.rename(temp, target);
+    send(res, replaced ? 200 : 201, { project, path: relative, size, sha256, replaced, url: artifactUrl(requestOrigin(req), project, relative) });
+  } finally {
+    await fs.rm(temp, { force: true });
+  }
+}
+
+async function tarList(archive, verbose) {
+  try {
+    const { stdout } = await execFileAsync('tar', [verbose ? '-tvf' : '-tf', archive, '--quoting-style=escape'], { maxBuffer: 64 * 1024 * 1024, timeout: COMMAND_TIMEOUT });
+    return stdout.split('\n').filter(Boolean);
+  } catch (error) { throw httpError(400, `Not a readable tar archive: ${errorText(error).slice(0, 500)}`); }
+}
+// Walk extracted files with lstat: only plain directories and single-link regular files are accepted.
+async function collectExtracted(dir, base = dir, out = { files: [], dirs: [] }) {
+  for (const entry of await fs.readdir(dir)) {
+    const full = path.join(dir, entry), stat = await fs.lstat(full);
+    if (stat.isDirectory()) { out.dirs.push(path.relative(base, full)); await collectExtracted(full, base, out); }
+    else if (stat.isFile() && stat.nlink === 1) out.files.push(path.relative(base, full));
+    else throw httpError(400, `Archive entry ${path.relative(base, full)} is not a regular file or directory.`);
+  }
+  return out;
+}
+
+// POST /archives/<project>[/<dir>]: tar or tar.gz/.bz2/.xz body, extracted into the project (or a subdirectory).
+async function handleArchiveUpload(req, res, url) {
+  const [project, ...rest] = pathSegments(url.pathname, '/archives/');
+  if (!project) throw httpError(400, 'Usage: POST /archives/<project>[/<dir>] with a tar or tar.gz body.');
+  const cwd = await existingProject(project);
+  const destination = rest.join('/');
+  relativeSafe(cwd, destination || '.');
+  const noOverwrite = req.headers['if-none-match'] === '*';
+  const work = await fs.mkdtemp(path.join(STAGING, 'archive-'));
+  try {
+    const archive = path.join(work, 'upload.tar'), extracted = path.join(work, 'files');
+    await fs.mkdir(extracted);
+    const received = await receiveUpload(req, archive);
+
+    // Vet the listing before anything is written to disk.
+    const names = await tarList(archive, false), details = await tarList(archive, true);
+    if (names.length !== details.length) throw httpError(400, 'Could not read the archive listing unambiguously.');
+    if (names.length > MAX_ARCHIVE_ENTRIES) throw httpError(413, `Archive has ${names.length} entries; limit is ${MAX_ARCHIVE_ENTRIES}.`);
+    let total = 0;
+    for (const [index, name] of names.entries()) {
+      if (name.startsWith('/') || name.split('/').includes('..')) throw httpError(400, `Unsafe archive path: ${name}`);
+      const match = /^([-d])\S*\s+\S+\s+(\d+)\s/.exec(details[index]);
+      if (!match) throw httpError(400, `Archive entry ${name} is not a regular file or directory.`);
+      total += Number(match[2]);
+    }
+    if (total > MAX_EXTRACT_BYTES) throw httpError(413, `Archive expands to ${total} bytes; limit is ${MAX_EXTRACT_BYTES} (HF_MAX_EXTRACT_BYTES).`);
+
+    try {
+      await execFileAsync('tar', ['-xf', archive, '-C', extracted, '--no-same-owner', '--no-same-permissions'], { maxBuffer: MAX_OUTPUT, timeout: COMMAND_TIMEOUT });
+    } catch (error) { throw httpError(400, `Extraction failed: ${errorText(error).slice(0, 500)}`); }
+    const { files, dirs } = await collectExtracted(extracted);
+
+    const plan = files.sort().map(file => {
+      const relative = toPosix(path.join(destination, file));
+      return { source: path.join(extracted, file), relative, target: relativeSafe(cwd, relative) };
+    });
+    for (const item of plan) await assertWritableTarget(item.target, item.relative, noOverwrite);
+    for (const dir of dirs) await fs.mkdir(relativeSafe(cwd, path.join(destination, dir)), { recursive: true });
+
+    const origin = requestOrigin(req), written = [];
+    for (const item of plan) {
+      await fs.mkdir(path.dirname(item.target), { recursive: true });
+      relativeSafe(cwd, item.relative);
+      await moveInto(item.source, item.target);
+      written.push(await describeFile(origin, project, cwd, item.target));
+    }
+    send(res, 201, { project, directory: destination || '.', archive: received, files: written });
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+}
+
+// GET/HEAD /artifacts/<project>/<file>, with single-range support for seeking and resumable downloads.
+async function handleArtifact(req, res, url) {
+  const [project, ...rest] = pathSegments(url.pathname, '/artifacts/');
+  if (!project || !rest.length) throw httpError(400, 'Usage: /artifacts/<project>/<file>');
+  let target, stat;
+  try {
+    target = relativeSafe(projectPath(project), rest.join('/'));
+    stat = await fs.stat(target);
+  } catch { throw httpError(404, 'File not found'); }
+  if (!stat.isFile()) throw httpError(404, 'Not a file');
+
+  const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  const headers = {
+    'content-type': contentTypeFor(target), 'accept-ranges': 'bytes', etag,
+    'last-modified': stat.mtime.toUTCString(), 'content-disposition': contentDisposition(path.basename(target)), 'cache-control': 'no-store',
+  };
+  let status = 200, start = 0, end = stat.size - 1;
+  const ifRange = req.headers['if-range'];
+  if (req.headers.range && (!ifRange || ifRange === etag || ifRange === headers['last-modified'])) {
+    const range = parseRange(req.headers.range, stat.size);
+    if (range === false) return send(res, 416, 'Range not satisfiable', { 'content-range': `bytes */${stat.size}`, 'accept-ranges': 'bytes' });
+    if (range) { [start, end] = range; status = 206; headers['content-range'] = `bytes ${start}-${end}/${stat.size}`; }
+  }
+  headers['content-length'] = stat.size === 0 ? 0 : end - start + 1;
+  res.writeHead(status, headers);
+  if (req.method === 'HEAD' || stat.size === 0) return res.end();
+  await pipeline(createReadStream(target, { start, end }), res).catch(() => {});
+}
+
+const ROUTES = [
+  { prefix: '/artifacts/', methods: ['GET', 'HEAD'], handle: handleArtifact },
+  { prefix: '/files/', methods: ['PUT'], handle: handleFileUpload },
+  { prefix: '/archives/', methods: ['POST'], handle: handleArchiveUpload },
+];
 
 const httpServer = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, service: PACKAGE.name, version: PACKAGE.version, hyperframesVersion: PACKAGE.dependencies.hyperframes }));
-      return;
+      return send(res, 200, { ok: true, service: PACKAGE.name, version: PACKAGE.version, hyperframesVersion: PACKAGE.dependencies.hyperframes, maxUploadBytes: MAX_UPLOAD_BYTES });
     }
-
     if (url.pathname === '/' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('HyperFrames MCP server is running.\nMCP endpoint: /mcp\nArtifacts: /artifacts/<project>/<file>');
-      return;
+      return send(res, 200, 'HyperFrames MCP server is running.\nMCP endpoint: /mcp\nDownload: GET /artifacts/<project>/<file>\nUpload file: PUT /files/<project>/<path>\nUpload archive: POST /archives/<project>[/<dir>]\n');
     }
-
-    // Safe artifact download: /artifacts/<project>/<relative-file>
-    if (url.pathname.startsWith('/artifacts/') && req.method === 'GET') {
-      const parts = url.pathname.slice('/artifacts/'.length).split('/').filter(Boolean);
-      if (parts.length < 2) {
-        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('Usage: /artifacts/<project>/<file>');
-        return;
+    const route = ROUTES.find(item => url.pathname.startsWith(item.prefix));
+    if (route) {
+      if (!route.methods.includes(req.method)) {
+        req.resume();
+        return send(res, 405, `Method not allowed. Use ${route.methods.join(' or ')}.`, { allow: route.methods.join(', ') });
       }
-      const projectName = parts[0];
-      const relFile = parts.slice(1).join('/');
-      try {
-        const cwd = projectPath(projectName);
-        const target = relativeSafe(cwd, relFile);
-        const stat = await fs.stat(target);
-        if (!stat.isFile()) {
-          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-          res.end('Not a file');
-          return;
-        }
-        res.writeHead(200, {
-          'content-type': contentTypeFor(target),
-          'content-length': stat.size,
-          'content-disposition': `inline; filename="${path.basename(target)}"`,
-          'cache-control': 'no-store',
-        });
-        createReadStream(target).pipe(res);
-        return;
-      } catch (e) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('File not found');
-        return;
+      try { return await route.handle(req, res, url); } catch (error) {
+        req.resume();
+        if (res.headersSent) return res.destroy();
+        const status = error.status || 500;
+        if (status === 500) console.error(error);
+        return send(res, status, { error: status === 500 ? 'Internal error' : error.message });
       }
     }
-
     nodeHandler(req, res);
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('Internal error');
+    console.error(e);
+    if (!res.headersSent) send(res, 500, 'Internal error');
   }
 });
 
+// Keep idle connections longer than typical proxy/client pools (Render's proxy keeps ~60s), so a reused
+// connection is not closed by the server at the moment a client sends on it.
+httpServer.keepAliveTimeout = 65_000;
+httpServer.headersTimeout = 66_000;
+// Node's default 300s request timeout would cut off large uploads on slow links.
+httpServer.requestTimeout = Number(process.env.HF_REQUEST_TIMEOUT_MS || 60 * 60 * 1000);
+
 httpServer.listen(PORT, HOST, () => {
   console.log(`HyperFrames MCP server listening on http://${HOST}:${PORT}/mcp`);
-  console.log(`Artifacts: http://${HOST}:${PORT}/artifacts/<project>/<file>`);
+  console.log(`Artifacts: GET http://${HOST}:${PORT}/artifacts/<project>/<file>`);
+  console.log(`Uploads: PUT /files/<project>/<path>, POST /archives/<project>[/<dir>] (max ${MAX_UPLOAD_BYTES} bytes)`);
   console.log(`HyperFrames binary: ${HYPERFRAMES_BIN}`);
 });
