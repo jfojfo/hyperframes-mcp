@@ -58,6 +58,17 @@ async function call(name, args = {}, expectedError = false) {
   return result.content.filter(item => item.type === 'text').map(item => item.text).join('\n');
 }
 const sha256 = data => createHash('sha256').update(data).digest('hex');
+// hyperframes_render returns a job; poll hyperframes_render_status until it is terminal.
+async function render(args) {
+  let view = JSON.parse(await call('hyperframes_render', { ...args, waitSeconds: 5 }));
+  assert.match(view.jobId, /^render-/);
+  for (let i = 0; i < 60 && !['succeeded', 'failed', 'cancelled'].includes(view.status); i++) {
+    view = JSON.parse(await call('hyperframes_render_status', { jobId: view.jobId, waitSeconds: 30 }));
+  }
+  assert.equal(view.status, 'succeeded', JSON.stringify(view, null, 2));
+  (report.responses.renderJobs ??= []).push(view);
+  return view;
+}
 async function http(method, file, body, headers = {}) {
   const response = await fetch(`${base}${file}`, { method, body, headers, ...(body?.getReader ? { duplex: 'half' } : {}) });
   return { status: response.status, headers: response.headers, body: Buffer.from(await response.arrayBuffer()) };
@@ -208,8 +219,12 @@ try {
   report.initialize = await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'hyperframes-smoke', version: '1' } });
   const { tools } = await rpc('tools/list', {});
   report.tools = tools.map(tool => tool.name);
-  assert.equal(tools.length, 21);
-  for (const name of ['hyperframes_check', 'hyperframes_snapshot', 'hyperframes_timeline', 'hyperframes_audio', 'hyperframes_version']) assert.ok(report.tools.includes(name));
+  assert.equal(tools.length, 24);
+  for (const name of ['hyperframes_check', 'hyperframes_snapshot', 'hyperframes_timeline', 'hyperframes_audio', 'hyperframes_version',
+    'hyperframes_render_status', 'hyperframes_render_cancel', 'hyperframes_render_list']) assert.ok(report.tools.includes(name));
+  // workers must stay advertised as integer-or-string so clients can send "4" or "auto".
+  const workersSchema = tools.find(tool => tool.name === 'hyperframes_render').inputSchema.properties.workers;
+  assert.deepEqual(workersSchema.anyOf.map(item => item.type).sort(), ['integer', 'string'], JSON.stringify(workersSchema));
   assert.equal((await call('hyperframes_version')).trim(), '0.9.43');
   await call('hyperframes_init', { name: project, fps: 24 });
   assert.match(await fs.readFile(path.join(workspace, project, 'index.html'), 'utf8'), /data-fps="24"/);
@@ -235,7 +250,24 @@ try {
   await call('hyperframes_snapshot', { project, output: '.', frames: 1 }, true);
   await call('hyperframes_render', { project, output: '../escape.mp4' }, true);
   await call('hyperframes_render', { project, crf: 20, videoBitrate: '1M' }, true);
-  await call('hyperframes_render', { project, quality: 'looks', output: 'renders/smoke.mp4', workers: 1, lowMemoryMode: true, framesCacheDir: 'off', gpu: false, browserGpu: false });
+  await call('hyperframes_render', { project, workers: 0 }, true);
+  await call('hyperframes_render', { project, workers: '33' }, true);
+  await call('hyperframes_render', { project: 'missing-project-xyz' }, true);
+  await call('hyperframes_render_status', { jobId: 'render-does-not-exist' }, true);
+  // workers as a numeric string: some clients send anyOf integer|string parameters this way.
+  const renderView = await render({ project, quality: 'looks', output: 'renders/smoke.mp4', workers: '1', lowMemoryMode: true, framesCacheDir: 'off', gpu: false, browserGpu: false });
+  assert.ok(renderView.args.includes('--workers') && renderView.args.includes('1'));
+  report.checks.push('render job accepts workers as a numeric string and finishes via status polling');
+  assert.equal(renderView.warnings, undefined);
+  // start/end goes through HyperFrames' segmented path; the job must say workers/browserGpu are ignored there.
+  const rangeView = await render({ project, output: 'renders/range.mp4', start: 0, end: 0.5, workers: 4, browserGpu: false });
+  assert.match(rangeView.warnings?.[0] ?? '', /ignores workers/);
+  const rangeProbe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v', '-show_entries', 'stream=nb_read_frames', '-of', 'json', path.join(workspace, project, 'renders/range.mp4')], { encoding: 'utf8' }));
+  assert.equal(rangeProbe.streams[0].nb_read_frames, '12');
+  const cliRange = await rpc('tools/call', { name: 'hyperframes_cli', arguments: { project, command: 'render', args: ['--start', '0', '--unsupported-range-smoke-flag'] } });
+  assert.ok(cliRange.isError);
+  assert.match(cliRange.content[0].text, /^WARNING: start\/end/);
+  report.checks.push('start/end renders carry the segmented-path warning (render job + CLI)');
   const video = path.join(workspace, project, 'renders/smoke.mp4');
   const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', video], { encoding: 'utf8' }));
   const stream = probe.streams.find(item => item.codec_type === 'video');
@@ -243,10 +275,8 @@ try {
   assert.equal(stream.avg_frame_rate, '24/1');
   execFileSync('ffmpeg', ['-v', 'error', '-i', video, '-f', 'null', '-'], { stdio: 'pipe' });
   report.media = probe;
-  const renderResult = report.responses.hyperframes_render.at(-1);
-  const { artifacts } = JSON.parse(renderResult.content[1].text);
-  const reported = artifacts.find(item => item.path === 'renders/smoke.mp4');
-  assert.ok(reported, renderResult.content[1].text);
+  const reported = renderView.artifacts.find(item => item.path === 'renders/smoke.mp4');
+  assert.ok(reported, JSON.stringify(renderView));
   assert.equal(reported.sha256, sha256(await fs.readFile(video)));
   assert.equal(reported.url, `${base}/artifacts/${project}/renders/smoke.mp4`);
   assert.equal((await fetch(reported.url, { method: 'HEAD' })).headers.get('content-length'), String(reported.size));
@@ -263,7 +293,15 @@ try {
   assert.equal(snapshot.headers.get('content-type'), 'image/png');
   assert.deepEqual(Buffer.from(await snapshot.arrayBuffer()), await fs.readFile(path.join(workspace, project, png)));
   // Exercise new HLS output plus the new downloadable playlist/segment types.
-  await call('hyperframes_render', { project, format: 'hls', output: 'renders/hls', workers: 1, lowMemoryMode: true, browserGpu: false, hlsSegmentSeconds: 1 });
+  await render({ project, format: 'hls', output: 'renders/hls', workers: 1, lowMemoryMode: true, browserGpu: false, hlsSegmentSeconds: 1 });
+  // Cancel: a queued or running job must end as cancelled and stay listed.
+  const cancelTarget = JSON.parse(await call('hyperframes_render', { project, output: 'renders/cancel.mp4', workers: 1, browserGpu: false }));
+  const cancelled = JSON.parse(await call('hyperframes_render_cancel', { jobId: cancelTarget.jobId }));
+  assert.equal(cancelled.status, 'cancelled', JSON.stringify(cancelled));
+  const listed = JSON.parse(await call('hyperframes_render_list', { project }));
+  assert.equal(listed.jobs.find(job => job.jobId === cancelTarget.jobId)?.status, 'cancelled');
+  assert.equal(listed.jobs.filter(job => job.status === 'succeeded').length, 3);
+  report.checks.push('render cancel + list');
   const hlsFiles = JSON.parse(await call('project_list_files', { project, subdir: 'renders/hls' }));
   const playlist = hlsFiles.find(file => file.endsWith('.m3u8'));
   const segment = hlsFiles.find(file => file.endsWith('.ts'));

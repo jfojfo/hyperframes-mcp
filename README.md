@@ -34,7 +34,9 @@ Configuration:
 | `PORT` | `9006` |
 | `HF_WORKSPACE` | `<this-repo>/workspace/projects` |
 | `HYPERFRAMES_BIN` | `<this-repo>/node_modules/.bin/hyperframes` |
-| `HF_COMMAND_TIMEOUT_MS` | `900000` (15 minutes per command) |
+| `HF_COMMAND_TIMEOUT_MS` | `900000` (15 minutes per synchronous command; does not apply to `hyperframes_render` jobs) |
+| `HF_RENDER_TIMEOUT_MS` | `7200000` (2 hours per render job; the job is then stopped and marked failed) |
+| `HF_MAX_CONCURRENT_RENDERS` | `1` (render jobs running at once; later jobs queue) |
 | `PUPPETEER_EXECUTABLE_PATH` / `HYPERFRAMES_BROWSER_PATH` | Explicit browser override, otherwise auto-detect |
 | `HF_MAX_UPLOAD_BYTES` | `1073741824` (1 GiB per upload request, file or archive) |
 | `HF_MAX_EXTRACT_BYTES` | `2147483648` (2 GiB total extracted size per archive) |
@@ -85,7 +87,10 @@ After connecting, Claude should discover tools such as:
 - `hyperframes_lint`
 - `hyperframes_validate`
 - `hyperframes_compositions`
-- `hyperframes_render`
+- `hyperframes_render` (submits a background job)
+- `hyperframes_render_status`
+- `hyperframes_render_cancel`
+- `hyperframes_render_list`
 - `hyperframes_transcribe`
 - `hyperframes_tts`
 - `hyperframes_catalog`
@@ -102,7 +107,7 @@ Projects are retained under `HF_WORKSPACE/<project>/`. The MCP server does not c
 - Snapshots: `.hyperframes/artifacts/snapshots/<unique-id>/`; check reports: `.hyperframes/artifacts/checks/`.
 - Intermediate render work: on macOS/Windows, OS temp directory `hf-render-*`; on Linux, `work-<job-id>-*` next to the output. HyperFrames normally removes this work directory on success/failure. Debug mode, `KEEP_TEMP=1`, or an abrupt process/host failure can leave files behind.
 - Extracted media cache: OS temp directory `hyperframes-extract-cache-<uid>` by default, reused across renders. Set render `framesCacheDir: "off"` to disable this cache for a render.
-- A LAN client gets text/JSON results, then downloads files using `/artifacts/<project>/<relative-file>`. Files are not automatically copied to the client. `hyperframes_render` returns a second JSON content item listing the files it wrote with `url`, `size` and `sha256`. Use `project_list_files` to discover other media, including HLS segments and PNG sequence files.
+- A LAN client gets text/JSON results, then downloads files using `/artifacts/<project>/<relative-file>`. Files are not automatically copied to the client. When a render job succeeds, `hyperframes_render_status` lists the files it wrote under `artifacts`, each with `url`, `size` and `sha256`. Use `project_list_files` to discover other media, including HLS segments and PNG sequence files.
 
 ## Binary files over HTTP
 
@@ -126,7 +131,20 @@ tar -czf assets.tgz -C ./assets . && curl --data-binary @assets.tgz "$BASE/archi
 curl -C - -o out.mp4 "$BASE/artifacts/demo/renders/out.mp4"   # resumable download
 ```
 
-Rendering is synchronous: the tool waits for the CLI to finish and then returns its output. There is no persistent render queue or job-status API. The MCP client needs a timeout suitable for the video length, within the server command limit.
+## Render jobs
+
+MCP clients usually time out a tool call after about a minute, while renders often take longer. Rendering therefore runs as a background job:
+
+1. `hyperframes_render` validates the arguments, queues the job and returns at once with `jobId` and `status`. Invalid arguments still fail immediately.
+2. `hyperframes_render_status { jobId, waitSeconds?, logLines? }` returns `queued` (with `queuePosition`), `running` (with `progress` from the CLI's `@hf-progress` lines and `etaSeconds` when known), `succeeded` (with the CLI `output` and `artifacts`), `failed` (with `error` and a longer `logTail`) or `cancelled`. `waitSeconds` (0–30) blocks until the job finishes or the time runs out; keep it below the client's tool-call timeout.
+3. `hyperframes_render_cancel { jobId }` stops a queued or running job (SIGTERM to the whole process group, SIGKILL after 10 s).
+4. `hyperframes_render_list { project? }` lists jobs.
+
+`hyperframes_render` also accepts `waitSeconds`, so a short render can finish within the submitting call. Jobs run one at a time by default (`HF_MAX_CONCURRENT_RENDERS`). Job state lives in memory: a server restart stops running renders and forgets all jobs (rendered files stay in the project), and only the latest 200 finished jobs are kept. `hyperframes_cli` with `command: "render"` is still synchronous and subject to the client timeout.
+
+`start`/`end` (and `--start`/`--end` through `hyperframes_cli`) make HyperFrames 0.9.43 use its segmented path, which ignores `workers` (automatic count, about frames/30 per chunk), renders WebGL in software (SwiftShader) even with `browserGpu: true`, and restarts Chrome for each chunk the range touches. The render job view then carries a `warnings` entry, and `hyperframes_cli` prefixes its output with `WARNING:`. Do not use range renders to measure speed or GPU benefit; render the whole composition instead.
+
+Numeric parameters whose schema is "number or string" (`workers`, `fps`, `waitSeconds`, `logLines`) also accept digit strings such as `"4"`, because some clients send them that way.
 
 ## Verification
 
@@ -135,7 +153,7 @@ npm run check
 npm run smoke
 ```
 
-The smoke check starts an isolated loopback server and exercises real HTTP MCP calls, project creation, lint/check, snapshots, timeline, MP4 and HLS renders, full FFmpeg decode, artifact download, binary upload/archive/Range/symlink-escape checks, local audio analysis, transcript import, and error handling. It preserves media and reports in `workspace/verification/`. Chrome and FFmpeg must be installed. Speech/TTS model downloads are not part of the smoke check.
+The smoke check starts an isolated loopback server and exercises real HTTP MCP calls, project creation, lint/check, snapshots, timeline, MP4 and HLS render jobs (submit, status polling, cancel, list), full FFmpeg decode, artifact download, binary upload/archive/Range/symlink-escape checks, local audio analysis, transcript import, and error handling. It preserves media and reports in `workspace/verification/`. Chrome and FFmpeg must be installed. Speech/TTS model downloads are not part of the smoke check.
 
 See [the version comparison and verification notes](docs/hyperframes-upgrade.md) for the upgrade scope and limits.
 

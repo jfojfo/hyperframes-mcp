@@ -1,6 +1,6 @@
 {
   "name": "hyperframes-mcp-server",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "description": "Remote MCP server that exposes HyperFrames video creation and rendering tools over Streamable HTTP.",
   "type": "module",

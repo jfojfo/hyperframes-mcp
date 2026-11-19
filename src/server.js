@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { promises as fs, createReadStream, createWriteStream, existsSync, realpathSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
@@ -22,7 +22,10 @@ const HYPERFRAMES_BIN = process.env.HYPERFRAMES_BIN || fileURLToPath(new URL('..
 const DEFAULT_BROWSER = '/usr/local/bin/hyperframes-chromium';
 const PACKAGE = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const projectSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$/);
-const fpsSchema = z.union([z.number().int().min(1).max(240), z.string().regex(/^\d+\/[1-9]\d*$/).refine(value => { const [n, d] = value.split('/').map(Number); return n / d >= 1 && n / d <= 240; }, 'Frame rate must be between 1 and 240')]);
+// Some MCP clients send numbers as strings when a parameter's schema is an anyOf of number and string,
+// so the string branches also accept plain digits ("30", "4").
+const fpsSchema = z.union([z.number().int().min(1).max(240), z.string().regex(/^\d+(\/[1-9]\d*)?$/, 'Use an integer or a fraction like 30000/1001').refine(value => { const [n, d = 1] = value.split('/').map(Number); return n / d >= 1 && n / d <= 240; }, 'Frame rate must be between 1 and 240')]);
+const workersSchema = z.union([z.number().int().min(1).max(32), z.string().regex(/^(auto|[1-9]\d*)$/, 'Use an integer from 1 to 32, or "auto"').refine(value => value === 'auto' || Number(value) <= 32, 'workers must be at most 32')]);
 const timesSchema = z.array(z.number().nonnegative()).min(1).max(100);
 const CLI_COMMANDS = ['doctor', 'init', 'info', 'lint', 'validate', 'check', 'preview', 'render', 'compositions', 'catalog', 'add', 'transcribe', 'tts', 'upgrade', 'docs', 'snapshot', 'timeline', 'audio', 'normalize-audio', 'beats', 'inspect', 'keyframes', 'layout', 'measure', 'diff', 'compare', 'grade-compare', 'media-treatment', 'media-use', 'remove-background', 'capture', 'history'];
 
@@ -119,20 +122,218 @@ function contentTypeFor(filePath) {
   if (ext === '.m4s') return 'video/iso.segment';
   return 'application/octet-stream';
 }
-async function runHyperframes(args, cwd = ROOT) {
+function hyperframesEnv() {
   const browserPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.HYPERFRAMES_BROWSER_PATH || (existsSync(DEFAULT_BROWSER) ? DEFAULT_BROWSER : undefined);
+  return {
+    ...process.env,
+    CI: '1',
+    ...(browserPath ? { PUPPETEER_EXECUTABLE_PATH: browserPath, HYPERFRAMES_BROWSER_PATH: browserPath } : {}),
+  };
+}
+async function runHyperframes(args, cwd = ROOT) {
   const { stdout, stderr } = await execFileAsync(HYPERFRAMES_BIN, args, {
     cwd,
-    env: {
-      ...process.env,
-      CI: '1',
-      ...(browserPath ? { PUPPETEER_EXECUTABLE_PATH: browserPath, HYPERFRAMES_BROWSER_PATH: browserPath } : {}),
-    },
+    env: hyperframesEnv(),
     timeout: COMMAND_TIMEOUT,
     maxBuffer: MAX_OUTPUT,
   });
   return { stdout: stdout.trim(), stderr: stderr.trim() };
 }
+
+// Background render jobs. MCP clients time out long tool calls (often ~60s), so hyperframes_render
+// submits a job and returns its id; hyperframes_render_status polls it. Jobs live in memory only.
+const RENDER_TIMEOUT = Number(process.env.HF_RENDER_TIMEOUT_MS || 2 * 60 * 60 * 1000);
+const MAX_CONCURRENT_RENDERS = Math.max(1, Math.floor(Number(process.env.HF_MAX_CONCURRENT_RENDERS || 1)));
+const MAX_RETAINED_JOBS = 200;
+const LOG_TAIL_LINES = 500;
+const MAX_LOG_LINE = 2000;
+const MAX_WAIT_SECONDS = 30;
+const KILL_GRACE_MS = 10_000;
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
+const jobs = new Map();
+const renderQueue = [];
+let runningRenders = 0;
+
+const stripAnsi = text => text.replace(/\x1B\[[0-9;?]*[ -\/]*[@-~]/g, '');
+// HyperFrames 0.9.43 renders --start/--end through its distributed chunk path (renderSpan -> renderChunk), which
+// sizes workers automatically (about frames/30 per chunk, ignoring --workers), pins WebGL to software
+// (SwiftShader, ignoring --browser-gpu) and restarts Chrome for every chunk the range touches.
+const RANGE_RENDER_WARNING = 'start/end (--start/--end) renders use HyperFrames\' segmented path: it ignores workers (worker count is automatic, about frames/30 per chunk), always renders WebGL in software (SwiftShader) so browserGpu has no effect, and restarts Chrome for each chunk the range touches. Its speed is not representative of a full render; to measure GPU speed or use the requested workers, render the whole composition without start/end.';
+function renderWarnings(args) {
+  return args[0] === 'render' && args.some(arg => /^--(start|end)(=|$)/.test(arg)) ? [RANGE_RENDER_WARNING] : [];
+}
+function createRenderJob({ project, cwd, args, describe }) {
+  const job = {
+    id: `render-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`, project, cwd, args, describe,
+    warnings: renderWarnings(args),
+    status: 'queued', createdAt: Date.now(), startedAt: null, finishedAt: null,
+    progress: null, progressLine: null, log: [], stdout: [], stdoutBytes: 0, stdoutTruncated: false,
+    result: null, error: null, exitCode: null, signal: null, child: null, cancelRequested: false, timedOut: false, waiters: new Set(),
+  };
+  jobs.set(job.id, job);
+  renderQueue.push(job);
+  pruneJobs();
+  pumpRenderQueue();
+  return job;
+}
+function pruneJobs() {
+  const finished = [...jobs.values()].filter(job => TERMINAL.has(job.status));
+  for (const job of finished.slice(0, Math.max(0, jobs.size - MAX_RETAINED_JOBS))) jobs.delete(job.id);
+}
+function pumpRenderQueue() {
+  while (runningRenders < MAX_CONCURRENT_RENDERS && renderQueue.length) startRenderJob(renderQueue.shift());
+}
+function appendLog(job, line) {
+  job.log.push(line.length > MAX_LOG_LINE ? line.slice(0, MAX_LOG_LINE) + ' [truncated]' : line);
+  if (job.log.length > LOG_TAIL_LINES) job.log.splice(0, job.log.length - LOG_TAIL_LINES);
+}
+// Machine progress ("@hf-progress {json}") and progress-bar lines update the status instead of the log.
+function handleOutputLine(job, raw, isStdout) {
+  const line = stripAnsi(raw).trimEnd();
+  if (!line.trim()) return;
+  if (line.startsWith('@hf-progress ')) {
+    try { job.progress = JSON.parse(line.slice('@hf-progress '.length)); } catch { appendLog(job, line); }
+    return;
+  }
+  if (/[\u2588\u2591]/.test(line) && /\d+%/.test(line)) { job.progressLine = line.replace(/[\u2588\u2591]+/g, '').trim(); return; }
+  appendLog(job, line);
+  if (!isStdout) return;
+  job.stdoutBytes += line.length + 1;
+  if (job.stdoutBytes > MAX_OUTPUT) job.stdoutTruncated = true;
+  else job.stdout.push(line);
+}
+function lineReader(onLine) {
+  let pending = '';
+  return {
+    push(chunk) {
+      const parts = (pending + chunk).split(/\r\n|\n|\r/);
+      pending = parts.pop();
+      for (const part of parts) onLine(part);
+      if (pending.length > 64 * 1024) { onLine(pending); pending = ''; }
+    },
+    flush() { if (pending) onLine(pending); pending = ''; },
+  };
+}
+function killProcessGroup(child, signal) {
+  // detached: true put the CLI in its own process group, so Chromium and FFmpeg children die with it.
+  try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} }
+}
+function startRenderJob(job) {
+  runningRenders++;
+  job.status = 'running';
+  job.startedAt = Date.now();
+  let child;
+  try {
+    child = spawn(HYPERFRAMES_BIN, job.args, { cwd: job.cwd, env: hyperframesEnv(), detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    return finishRenderJob(job, { spawnError: error });
+  }
+  job.child = child;
+  const out = lineReader(line => handleOutputLine(job, line, true));
+  const err = lineReader(line => handleOutputLine(job, line, false));
+  child.stdout.setEncoding('utf8').on('data', chunk => out.push(chunk));
+  child.stderr.setEncoding('utf8').on('data', chunk => err.push(chunk));
+  const timer = setTimeout(() => { job.timedOut = true; stopRenderJob(job); }, RENDER_TIMEOUT);
+  timer.unref();
+  // 'error' also fires when a kill fails; only a process that never started is finished here ('close' covers the rest).
+  child.on('error', error => { if (child.pid === undefined) { clearTimeout(timer); finishRenderJob(job, { spawnError: error }); } });
+  child.once('close', (code, signal) => {
+    clearTimeout(timer);
+    out.flush(); err.flush();
+    finishRenderJob(job, { code, signal });
+  });
+}
+async function finishRenderJob(job, { code = null, signal = null, spawnError } = {}) {
+  if (job.finishing) return;
+  job.finishing = true;
+  job.child = null;
+  job.exitCode = code;
+  job.signal = signal;
+  if (job.cancelRequested) job.status = 'cancelled';
+  else if (job.timedOut) {
+    job.status = 'failed';
+    job.error = `Render exceeded HF_RENDER_TIMEOUT_MS (${RENDER_TIMEOUT} ms) and was stopped.`;
+  } else if (spawnError) {
+    job.status = 'failed';
+    job.error = `Could not start HyperFrames: ${spawnError.message}`;
+  } else if (code === 0) {
+    try { job.result = await job.describe(job.startedAt); } catch (error) { job.result = { describeError: errorText(error) }; }
+    job.status = 'succeeded';
+  } else {
+    job.status = 'failed';
+    job.error = `HyperFrames exited with ${signal ? `signal ${signal}` : `code ${code}`}. See logTail for details.`;
+  }
+  job.finishedAt = Date.now();
+  runningRenders--;
+  for (const wake of job.waiters) wake();
+  job.waiters.clear();
+  pruneJobs();
+  pumpRenderQueue();
+}
+function stopRenderJob(job) {
+  if (job.status === 'queued') {
+    renderQueue.splice(renderQueue.indexOf(job), 1);
+    job.cancelRequested = true;
+    job.status = 'cancelled';
+    job.finishedAt = Date.now();
+    for (const wake of job.waiters) wake();
+    job.waiters.clear();
+    return;
+  }
+  if (!job.child) return;
+  const child = job.child;
+  killProcessGroup(child, 'SIGTERM');
+  setTimeout(() => { if (child.exitCode === null && child.signalCode === null) killProcessGroup(child, 'SIGKILL'); }, KILL_GRACE_MS).unref();
+}
+function waitForJob(job, seconds) {
+  if (!seconds || TERMINAL.has(job.status)) return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); job.waiters.delete(done); resolve(); };
+    const timer = setTimeout(done, Math.min(seconds, MAX_WAIT_SECONDS) * 1000);
+    job.waiters.add(done);
+  });
+}
+function getJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) throw new Error(`Render job "${jobId}" not found. Jobs are kept in memory only: they are lost when the server restarts, and only the latest ${MAX_RETAINED_JOBS} finished jobs are retained.`);
+  return job;
+}
+function iso(ms) { return ms ? new Date(ms).toISOString() : null; }
+function jobView(job, { logLines = 20 } = {}) {
+  const now = job.finishedAt || Date.now();
+  const pct = typeof job.progress?.pct === 'number' ? job.progress.pct : null;
+  const runningSeconds = job.startedAt ? (now - job.startedAt) / 1000 : 0;
+  const view = {
+    jobId: job.id, project: job.project, status: job.status,
+    createdAt: iso(job.createdAt), startedAt: iso(job.startedAt), finishedAt: iso(job.finishedAt),
+    elapsedSeconds: Math.round(runningSeconds * 10) / 10,
+  };
+  if (job.warnings.length) view.warnings = job.warnings;
+  if (job.status === 'queued') view.queuePosition = renderQueue.indexOf(job) + 1;
+  if (job.status === 'running') {
+    view.progress = job.progress ?? (job.progressLine ? { text: job.progressLine } : null);
+    if (pct > 0 && pct < 100) view.etaSeconds = Math.round(runningSeconds * (100 - pct) / pct);
+  }
+  if (TERMINAL.has(job.status)) {
+    view.exitCode = job.exitCode;
+    if (job.signal) view.signal = job.signal;
+    if (job.error) view.error = job.error;
+    if (job.status === 'succeeded') {
+      view.output = job.stdout.join('\n') + (job.stdoutTruncated ? '\n[output truncated]' : '');
+      Object.assign(view, job.result);
+    }
+  }
+  view.args = job.args;
+  const lines = job.status === 'failed' ? Math.max(logLines, 40) : logLines;
+  if (lines > 0) view.logTail = job.log.slice(-lines);
+  if (!TERMINAL.has(job.status)) view.next = `Call hyperframes_render_status with jobId "${job.id}" (waitSeconds up to ${MAX_WAIT_SECONDS}) until status is succeeded, failed or cancelled.`;
+  return view;
+}
+function shutdownRenders() {
+  for (const job of jobs.values()) if (job.child) killProcessGroup(job.child, 'SIGKILL');
+}
+for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => { shutdownRenders(); process.exit(0); });
+process.once('exit', shutdownRenders);
 function textResult(text) { return { content: [{ type: 'text', text: String(text) }] }; }
 function jsonResult(value) { return textResult(JSON.stringify(value, null, 2)); }
 function errorText(error) { const message = error?.stderr || error?.stdout || error?.message || String(error); return message.length > MAX_OUTPUT ? message.slice(0, MAX_OUTPUT) + '\n[output truncated]' : message; }
@@ -151,8 +352,13 @@ function registerCliTool(server, name, description, schema, buildArgs, describeR
     try {
       const cwd = input.project ? projectPath(input.project) : ROOT;
       const startedAt = Date.now();
-      const result = await runHyperframes(buildArgs(input, cwd), cwd);
-      const text = result.stdout || result.stderr || 'Command completed.';
+      const args = buildArgs(input, cwd);
+      const prefix = renderWarnings(args).map(warning => `WARNING: ${warning}\n\n`).join('');
+      let result;
+      try { result = await runHyperframes(args, cwd); } catch (error) {
+        return prefix ? { ...textResult(prefix + errorText(error)), isError: true } : errorResult(error);
+      }
+      const text = prefix + (result.stdout || result.stderr || 'Command completed.');
       if (!describeResult) return textResult(text);
       let extra;
       try { extra = await describeResult(input, cwd, startedAt); } catch (error) { extra = { describeError: errorText(error) }; }
@@ -255,12 +461,12 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
   server.registerTool('hyperframes_lint', { title: 'Lint Project', description: 'Run HyperFrames linting.', inputSchema: z.object({ project: z.string().min(1), json: z.boolean().optional() }) }, async ({ project, json }) => { try { const args = ['lint']; if (json) args.push('--json'); const r = await runHyperframes(args, projectPath(project)); return textResult(r.stdout || r.stderr || 'Lint passed.'); } catch (e) { return errorResult(e); } });
   server.registerTool('hyperframes_validate', { title: 'Validate Project', description: 'Run HyperFrames validation.', inputSchema: z.object({ project: z.string().min(1) }) }, async ({ project }) => { try { return textResult((await runHyperframes(['validate'], projectPath(project))).stdout); } catch (e) { return errorResult(e); } });
   server.registerTool('hyperframes_compositions', { title: 'List Compositions', description: 'List composition IDs and durations.', inputSchema: z.object({ project: z.string().min(1) }) }, async ({ project }) => { try { return textResult((await runHyperframes(['compositions'], projectPath(project))).stdout); } catch (e) { return errorResult(e); } });
-  registerCliTool(server, 'hyperframes_render', 'Render on the MCP host using local Chromium and FFmpeg. Output paths are relative to the project. Does not use the official cloud.', z.object({
+  const renderSchema = z.object({
     project: projectSchema,
     quality: z.enum(['draft', 'standard', 'high', 'looks', 'delivery']).optional(),
     output: z.string().min(1).optional(), composition: z.string().min(1).optional(),
     fps: fpsSchema.optional(), format: z.enum(['mp4', 'mov', 'webm', 'gif', 'png-sequence', 'hls']).optional(),
-    workers: z.union([z.number().int().positive().max(32), z.literal('auto')]).optional(),
+    workers: workersSchema.optional(),
     crf: z.number().int().min(0).max(51).optional(), videoBitrate: z.string().optional(),
     gpu: z.boolean().optional(), docker: z.boolean().optional(), browserGpu: z.boolean().optional(),
     resolution: z.string().optional(), start: z.number().nonnegative().optional(), end: z.number().positive().optional(),
@@ -275,9 +481,11 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
     proresProfile: z.enum(['proxy', 'lt', '422', 'hq', '4444']).optional(),
     keyframeInterval: z.number().positive().optional(), maxBitrate: z.string().optional(), bufferSize: z.string().optional(),
     framesCacheDir: z.string().min(1).optional(),
+    waitSeconds: z.union([z.number().int().min(0).max(MAX_WAIT_SECONDS), z.string().regex(/^\d+$/).refine(v => Number(v) <= MAX_WAIT_SECONDS, `waitSeconds must be at most ${MAX_WAIT_SECONDS}`)]).optional(),
   }).refine(v => v.crf === undefined || v.videoBitrate === undefined, 'crf and videoBitrate are mutually exclusive')
     .refine(v => v.start === undefined || v.end === undefined || v.start < v.end, 'start must be before end')
-    .refine(v => !(v.hdr && v.sdr), 'hdr and sdr are mutually exclusive'), (input, cwd) => {
+    .refine(v => !(v.hdr && v.sdr), 'hdr and sdr are mutually exclusive');
+  const buildRenderArgs = (input, cwd) => {
     for (const key of ['output', 'composition', 'batch']) if (input[key]) relativeSafe(cwd, input[key]);
     if (input.framesCacheDir && !['off', 'none', 'false', '0'].includes(input.framesCacheDir)) relativeSafe(cwd, input.framesCacheDir);
     const args = appendOptions(['render'], input, {
@@ -292,7 +500,58 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
     });
     if (input.variables) args.push('--variables', JSON.stringify(input.variables));
     return args;
-  }, (input, cwd, startedAt) => describeRenderOutputs(origin, input.project, cwd, input.output, startedAt));
+  };
+  server.registerTool('hyperframes_render', {
+    title: 'Submit Render Job',
+    description: `Start a render on the MCP host (local Chromium and FFmpeg; not the official cloud) and return a jobId immediately. Poll hyperframes_render_status until status is succeeded, failed or cancelled; the succeeded status lists each output with url, size and sha256. Output paths are relative to the project. Renders run one at a time by default (HF_MAX_CONCURRENT_RENDERS); later jobs queue. waitSeconds (0-${MAX_WAIT_SECONDS}, default 0) waits that long before returning, so short renders can finish in one call; keep it below the client tool-call timeout. Note: start/end switch HyperFrames to a segmented path that ignores workers and browserGpu (automatic workers, software WebGL); the job view then carries a warning.`,
+    inputSchema: renderSchema,
+  }, async input => {
+    try {
+      const cwd = await existingProject(input.project);
+      const args = buildRenderArgs(input, cwd);
+      const job = createRenderJob({ project: input.project, cwd, args, describe: startedAt => describeRenderOutputs(origin, input.project, cwd, input.output, startedAt) });
+      await waitForJob(job, Number(input.waitSeconds || 0));
+      return { ...jsonResult(jobView(job)), ...(job.status === 'failed' ? { isError: true } : {}) };
+    } catch (error) { return errorResult(error); }
+  });
+  const jobIdSchema = z.string().min(1).max(100);
+  const logLinesSchema = z.union([z.number().int().min(0).max(LOG_TAIL_LINES), z.string().regex(/^\d+$/).refine(v => Number(v) <= LOG_TAIL_LINES, `logLines must be at most ${LOG_TAIL_LINES}`)]);
+  server.registerTool('hyperframes_render_status', {
+    title: 'Render Job Status',
+    description: `Status of a render job from hyperframes_render: queued, running (with progress and etaSeconds when known), succeeded (with output and artifacts: url, size, sha256), failed (with error and logTail) or cancelled. waitSeconds (0-${MAX_WAIT_SECONDS}, default 0) blocks until the job finishes or the time runs out; keep it below the client tool-call timeout. logLines (default 20, max ${LOG_TAIL_LINES}) sets how many recent log lines to include.`,
+    inputSchema: z.object({ jobId: jobIdSchema, waitSeconds: renderSchema.shape.waitSeconds, logLines: logLinesSchema.optional() }),
+  }, async ({ jobId, waitSeconds, logLines }) => {
+    try {
+      const job = getJob(jobId);
+      await waitForJob(job, Number(waitSeconds || 0));
+      return jsonResult(jobView(job, { logLines: logLines === undefined ? 20 : Number(logLines) }));
+    } catch (error) { return errorResult(error); }
+  });
+  server.registerTool('hyperframes_render_cancel', {
+    title: 'Cancel Render Job',
+    description: 'Cancel a queued or running render job. Running renders are stopped with SIGTERM, then SIGKILL after 10 seconds. Partial output may remain in the project.',
+    inputSchema: z.object({ jobId: jobIdSchema }),
+  }, async ({ jobId }) => {
+    try {
+      const job = getJob(jobId);
+      if (TERMINAL.has(job.status)) return jsonResult({ ...jobView(job, { logLines: 0 }), note: `Job already ${job.status}.` });
+      job.cancelRequested = true;
+      stopRenderJob(job);
+      await waitForJob(job, 15);
+      return jsonResult(jobView(job, { logLines: 0 }));
+    } catch (error) { return errorResult(error); }
+  });
+  server.registerTool('hyperframes_render_list', {
+    title: 'List Render Jobs',
+    description: 'List render jobs kept in memory (newest first), optionally for one project. Jobs are lost when the server restarts.',
+    inputSchema: z.object({ project: projectSchema.optional() }),
+  }, async ({ project }) => {
+    const list = [...jobs.values()].filter(job => !project || job.project === project).reverse().map(job => {
+      const { jobId, status, createdAt, startedAt, finishedAt, elapsedSeconds, queuePosition, progress, etaSeconds, error } = jobView(job, { logLines: 0 });
+      return { jobId, project: job.project, status, createdAt, startedAt, finishedAt, elapsedSeconds, queuePosition, progress, etaSeconds, error };
+    });
+    return jsonResult({ maxConcurrentRenders: MAX_CONCURRENT_RENDERS, running: runningRenders, queued: renderQueue.length, jobs: list });
+  });
   registerCliTool(server, 'hyperframes_transcribe', 'Transcribe on the MCP host or import SRT/VTT/JSON. Local engines only; may download speech models.', z.object({
     project: projectSchema, input: z.string().min(1), model: z.string().optional(),
     engine: z.enum(['auto', 'whisper', 'parakeet']).optional(), language: z.string().optional(), json: z.boolean().optional(),
@@ -338,7 +597,7 @@ function buildServer(ctx = {}) {
     const url = new URL(request.url);
     origin = forwardedOrigin(name => request.headers.get(name) ?? undefined, url.protocol.slice(0, -1), url.host);
   }
-  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). hyperframes_render returns each output URL with size and sha256.' });
+  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). Rendering is asynchronous: hyperframes_render returns a jobId at once; poll hyperframes_render_status (waitSeconds up to 30) until succeeded, which lists each output URL with size and sha256. hyperframes_render_cancel stops a job.' });
   registerTools(server, origin); return server;
 }
 const handler = createMcpHandler(buildServer);
