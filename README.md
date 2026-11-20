@@ -32,8 +32,8 @@ Configuration:
 | --- | --- |
 | `HOST` | `0.0.0.0` |
 | `PORT` | `9006` |
-| `HF_WORKSPACE` | `<this-repo>/workspace/projects` |
-| `HYPERFRAMES_BIN` | `<this-repo>/node_modules/.bin/hyperframes` |
+| `HF_WORKSPACE` | `<install dir>/.hyperframes-mcp/projects` (see Install); `<this-repo>/.hyperframes-mcp/projects` in a source checkout |
+| `HYPERFRAMES_BIN` | First `node_modules/.bin/hyperframes` found walking up from the package directory |
 | `HF_COMMAND_TIMEOUT_MS` | `900000` (15 minutes per synchronous command; does not apply to `hyperframes_render` jobs) |
 | `HF_RENDER_TIMEOUT_MS` | `7200000` (2 hours per render job; the job is then stopped and marked failed) |
 | `HF_MAX_CONCURRENT_RENDERS` | `1` (render jobs running at once; later jobs queue) |
@@ -47,6 +47,51 @@ Configuration:
 Health check:
 
 `http://localhost:9006/health`
+
+## Install
+
+`npm run package` builds a self-contained install directory, separate from the source checkout. Run it on the machine that will host the server (the install contains platform-specific binaries):
+
+```bash
+cd hyperframes-mcp            # source checkout
+npm ci
+npm run package -- --out=~/work/tools/hyperframes-mcp
+~/work/tools/hyperframes-mcp/hyperframes-mcp --version
+```
+
+It copies `bin/`, `src/` and the lockfile into `<out>/app/`, installs production dependencies there with `npm ci`, and writes the launcher `hyperframes-mcp` and a reference `hyperframes-mcp.env.example`.
+
+```text
+~/work/tools/hyperframes-mcp/
+├── hyperframes-mcp                launcher (launchd points here)
+├── hyperframes-mcp.env            your settings (optional; copy from the example)
+├── hyperframes-mcp.env.example    reference settings (replaced on upgrade)
+├── service.log                    launchd log, if you use the launchd agent
+├── app/                           server code and dependencies (replaced on upgrade)
+└── .hyperframes-mcp/projects/     projects (HF_WORKSPACE default), created by the server
+```
+
+**Upgrade**: pull the new source, run the same `npm run package -- --out=...`, then restart the server. Only `app/`, the launcher and the example are replaced; the new `app/` is installed beside the old one before being swapped in. `hyperframes-mcp.env` and `.hyperframes-mcp/` are kept.
+
+**Settings**: `cp hyperframes-mcp.env.example hyperframes-mcp.env` and edit it; it holds the environment variables from the table above. Flags override it: `hyperframes-mcp --help` lists `--host`, `--port`, `--workspace` and `--browser`. The launcher runs the first `node` (22+) on `PATH`, or `HYPERFRAMES_MCP_NODE`, and works through a symlink. It sets `HYPERFRAMES_MCP_HOME` to its own directory, which is where `.hyperframes-mcp/projects` is created; in a source checkout (`npm start`) that is the repo root instead.
+
+### Background service on macOS (launchd)
+
+Template: [`docs/launchd/com.example.hyperframes-mcp.plist`](docs/launchd/com.example.hyperframes-mcp.plist). launchd does not expand `~`: replace `/Users/YOUR_USER` with your home path. `PATH` in the template must contain `node`, `ffmpeg` and `ffprobe` (`which node ffmpeg`). Keep `ProcessType` = `Interactive`; `Background` or unset lets macOS throttle CPU and I/O for the server and its Chrome/FFmpeg processes. Set the browser in `hyperframes-mcp.env`, e.g. `PUPPETEER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+cp docs/launchd/com.example.hyperframes-mcp.plist ~/Library/LaunchAgents/
+# edit the paths, then:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hyperframes-mcp.plist   # start now and at login
+launchctl print gui/$(id -u)/com.example.hyperframes-mcp | head -20                          # status
+launchctl kickstart -k gui/$(id -u)/com.example.hyperframes-mcp                              # restart (e.g. after upgrade)
+launchctl bootout gui/$(id -u)/com.example.hyperframes-mcp                                   # stop and disable
+tail -f ~/work/tools/hyperframes-mcp/service.log                                             # log
+curl --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:9006/health             # wait until ready
+```
+
+Stopping sends SIGTERM: running render jobs are stopped and lost (jobs live in memory), so resubmit them after a restart. Projects and finished outputs stay on disk.
 
 ## Optional Render.com / Docker deployment
 

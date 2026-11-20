@@ -15,7 +15,11 @@ import * as z from 'zod/v4';
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 9006);
 const HOST = process.env.HOST || '0.0.0.0';
-const ROOT = path.resolve(process.env.HF_WORKSPACE || fileURLToPath(new URL('../workspace/projects', import.meta.url)));
+// Projects default to <home>/.hyperframes-mcp/projects. The launcher written by `npm run package` sets
+// HYPERFRAMES_MCP_HOME to the install directory (code lives in its app/ subdirectory, which upgrades replace);
+// a source checkout uses the repo root.
+const HOME_DIR = path.resolve(process.env.HYPERFRAMES_MCP_HOME || fileURLToPath(new URL('..', import.meta.url)));
+const ROOT = path.resolve(process.env.HF_WORKSPACE || path.join(HOME_DIR, '.hyperframes-mcp', 'projects'));
 const MAX_OUTPUT = 4 * 1024 * 1024;
 const COMMAND_TIMEOUT = Number(process.env.HF_COMMAND_TIMEOUT_MS || 15 * 60 * 1000);
 const HYPERFRAMES_BIN = process.env.HYPERFRAMES_BIN || fileURLToPath(new URL('../node_modules/.bin/hyperframes', import.meta.url));
@@ -947,5 +951,6 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`HyperFrames MCP server listening on http://${HOST}:${PORT}/mcp`);
   console.log(`Artifacts: GET http://${HOST}:${PORT}/artifacts/<project>/<file>`);
   console.log(`Uploads: PUT /files/<project>/<path>, POST /archives/<project>[/<dir>] (max ${MAX_UPLOAD_BYTES} bytes)`);
+  console.log(`Workspace: ${ROOT}`);
   console.log(`HyperFrames binary: ${HYPERFRAMES_BIN}`);
 });
