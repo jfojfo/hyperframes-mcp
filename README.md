@@ -84,6 +84,7 @@ After connecting, Claude should discover tools such as:
 - `project_write_file`
 - `project_read_file`
 - `project_list_files`
+- `project_cleanup` (delete a finished project, or only its intermediate files)
 - `hyperframes_lint`
 - `hyperframes_validate`
 - `hyperframes_compositions`
@@ -108,6 +109,19 @@ Projects are retained under `HF_WORKSPACE/<project>/`. The MCP server does not c
 - Intermediate render work: on macOS/Windows, OS temp directory `hf-render-*`; on Linux, `work-<job-id>-*` next to the output. HyperFrames normally removes this work directory on success/failure. Debug mode, `KEEP_TEMP=1`, or an abrupt process/host failure can leave files behind.
 - Extracted media cache: OS temp directory `hyperframes-extract-cache-<uid>` by default, reused across renders. Set render `framesCacheDir: "off"` to disable this cache for a render.
 - A LAN client gets text/JSON results, then downloads files using `/artifacts/<project>/<relative-file>`. Files are not automatically copied to the client. When a render job succeeds, `hyperframes_render_status` lists the files it wrote under `artifacts`, each with `url`, `size` and `sha256`. Use `project_list_files` to discover other media, including HLS segments and PNG sequence files.
+
+## Cleaning up finished projects
+
+Projects are never deleted automatically. When a project is finished and the client has downloaded the outputs it needs, call `project_cleanup`:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `project` | required | Project name. |
+| `scope` | `"project"` | `"project"` deletes the whole project directory (sources, uploads, renders) and forgets its finished render jobs. `"intermediate"` keeps sources and renders and deletes only `.hyperframes/artifacts/` (snapshots, check reports) and `work-<8 hex>-*` render work directories left behind by crashed or killed renders. |
+| `dryRun` | `false` | Return what would be deleted (paths, file counts, bytes) without deleting anything. |
+| `cancelRenders` | `false` | The call is refused while the project has queued or running render jobs. With `true`, those jobs are cancelled first (SIGTERM, then SIGKILL after 10 s); if one does not stop, nothing is deleted. |
+
+The result lists each removed path with `files` and `bytes`, plus `totalFiles` / `totalBytes`. A whole-project delete first renames the directory into the workspace staging area, so the project disappears at once (later tool calls, uploads and `/artifacts` downloads get "not found"), and then removes it. Deletion is permanent. The shared HyperFrames media cache (`hyperframes-extract-cache-<uid>` in the OS temp directory) is used by all projects and is not touched.
 
 ## Binary files over HTTP
 

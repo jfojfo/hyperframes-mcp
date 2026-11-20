@@ -89,6 +89,34 @@ async function hashFile(file) {
   await pipeline(createReadStream(file), hash);
   return hash.digest('hex');
 }
+// File count and bytes under a path, without following symlinks.
+async function diskUsage(target) {
+  const stat = await fs.lstat(target);
+  if (!stat.isDirectory()) return { files: 1, bytes: stat.size };
+  let files = 0, bytes = 0;
+  for (const entry of await fs.readdir(target)) {
+    const sub = await diskUsage(path.join(target, entry));
+    files += sub.files; bytes += sub.bytes;
+  }
+  return { files, bytes };
+}
+// HyperFrames on Linux renders into work-<8 hex>-* next to the output (see its work_dir pattern); it normally
+// removes the directory itself, so any left over belong to crashed or killed renders.
+const RENDER_WORK_DIR = /^work-[0-9a-f]{8}-/;
+async function intermediateTargets(cwd) {
+  const targets = [];
+  const artifacts = path.join(cwd, '.hyperframes', 'artifacts');
+  if ((await fs.lstat(artifacts).catch(() => null))?.isDirectory()) targets.push(artifacts);
+  const walk = async dir => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || ['node_modules', '.git', '.hyperframes'].includes(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (RENDER_WORK_DIR.test(entry.name)) targets.push(full); else await walk(full);
+    }
+  };
+  await walk(cwd);
+  return targets;
+}
 function toPosix(relative) { return relative.split(path.sep).join('/'); }
 function artifactUrl(origin, project, relative) {
   return `${origin}/artifacts/${[project, ...toPosix(relative).split('/')].map(encodeURIComponent).join('/')}`;
@@ -552,6 +580,48 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
     });
     return jsonResult({ maxConcurrentRenders: MAX_CONCURRENT_RENDERS, running: runningRenders, queued: renderQueue.length, jobs: list });
   });
+  server.registerTool('project_cleanup', {
+    title: 'Clean Up Project',
+    description: 'Free disk space on the MCP host once a project is finished. Download every output you need first: deleted files cannot be recovered. scope "project" (default) deletes the whole project directory, including sources, uploads and renders, and forgets its finished render jobs. scope "intermediate" keeps sources and renders and deletes only regenerable files: snapshots and check reports under .hyperframes/artifacts, and render work directories (work-<id>-*) left behind by crashed renders. Refuses while the project has queued or running render jobs unless cancelRenders is true. dryRun lists what would be deleted without deleting it.',
+    inputSchema: z.object({
+      project: projectSchema, scope: z.enum(['project', 'intermediate']).optional(),
+      dryRun: z.boolean().optional(), cancelRenders: z.boolean().optional(),
+    }),
+  }, async ({ project, scope = 'project', dryRun = false, cancelRenders = false }) => {
+    try {
+      const cwd = await existingProject(project);
+      const active = [...jobs.values()].filter(job => job.project === project && !TERMINAL.has(job.status));
+      if (active.length && !cancelRenders) {
+        throw new Error(`Project "${project}" has active render jobs: ${active.map(job => `${job.id} (${job.status})`).join(', ')}. Wait for them, cancel them with hyperframes_render_cancel, or pass cancelRenders: true.`);
+      }
+      const targets = scope === 'project' ? [cwd] : await intermediateTargets(cwd);
+      const removed = [];
+      for (const target of targets) removed.push({ path: toPosix(path.relative(cwd, target)) || '.', ...await diskUsage(target) });
+      const total = removed.reduce((sum, item) => ({ files: sum.files + item.files, bytes: sum.bytes + item.bytes }), { files: 0, bytes: 0 });
+      const summary = { project, scope, dryRun, removed, totalFiles: total.files, totalBytes: total.bytes };
+      if (dryRun) return jsonResult({ ...summary, ...(active.length ? { activeRenderJobs: active.map(job => job.id) } : {}) });
+
+      if (active.length) {
+        for (const job of active) { job.cancelRequested = true; stopRenderJob(job); }
+        await Promise.all(active.map(job => waitForJob(job, KILL_GRACE_MS / 1000 + 5)));
+        const stuck = active.filter(job => !TERMINAL.has(job.status));
+        if (stuck.length) throw new Error(`Render jobs did not stop in time: ${stuck.map(job => job.id).join(', ')}. Nothing was deleted; try again shortly.`);
+        summary.cancelledRenderJobs = active.map(job => job.id);
+      }
+      if (scope === 'project') {
+        // Rename first so the project disappears atomically (new tool calls and uploads get 404), then delete.
+        const trash = path.join(STAGING, `deleted-${project}-${randomBytes(6).toString('hex')}`);
+        await fs.rename(cwd, trash);
+        await fs.rm(trash, { recursive: true, force: true });
+        let forgotten = 0;
+        for (const job of [...jobs.values()]) if (job.project === project && TERMINAL.has(job.status)) { jobs.delete(job.id); forgotten++; }
+        summary.forgottenRenderJobs = forgotten;
+      } else {
+        for (const target of targets) await fs.rm(target, { recursive: true, force: true });
+      }
+      return jsonResult(summary);
+    } catch (error) { return errorResult(error); }
+  });
   registerCliTool(server, 'hyperframes_transcribe', 'Transcribe on the MCP host or import SRT/VTT/JSON. Local engines only; may download speech models.', z.object({
     project: projectSchema, input: z.string().min(1), model: z.string().optional(),
     engine: z.enum(['auto', 'whisper', 'parakeet']).optional(), language: z.string().optional(), json: z.boolean().optional(),
@@ -597,7 +667,7 @@ function buildServer(ctx = {}) {
     const url = new URL(request.url);
     origin = forwardedOrigin(name => request.headers.get(name) ?? undefined, url.protocol.slice(0, -1), url.host);
   }
-  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). Rendering is asynchronous: hyperframes_render returns a jobId at once; poll hyperframes_render_status (waitSeconds up to 30) until succeeded, which lists each output URL with size and sha256. hyperframes_render_cancel stops a job.' });
+  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). Create the project with hyperframes_init before uploading to it; uploads to a missing project fail with 404. Archives may contain only regular files and directories: an archive with any symlink or hard link is rejected as a whole, so dereference links when packing (tar -h / --dereference). Rendering is asynchronous: hyperframes_render returns a jobId at once; poll hyperframes_render_status (waitSeconds up to 30) until succeeded, which lists each output URL with size and sha256. hyperframes_render_cancel stops a job. When a project is finished and its outputs are downloaded, call project_cleanup to delete it (or scope "intermediate" to drop only snapshots and render leftovers).' });
   registerTools(server, origin); return server;
 }
 const handler = createMcpHandler(buildServer);

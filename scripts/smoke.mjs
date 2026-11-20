@@ -208,6 +208,38 @@ async function binaryTransferChecks() {
   await fs.rm(src, { recursive: true, force: true });
   check(`POST /archives: node-tar + ${systemTars.join("/") || "no system"} tar archives import; symlink, hardlink, ../, oversize and garbage rejected; staging cleaned`);
 }
+// project_cleanup runs on a throwaway project so the main smoke project and its media are preserved.
+async function cleanupChecks(html) {
+  const name = `${project}-cleanup`, dir = path.join(workspace, name);
+  await call('hyperframes_init', { name });
+  await call('project_write_file', { project: name, file: 'index.html', content: html });
+  await fs.mkdir(path.join(dir, '.hyperframes/artifacts/snapshots/x'), { recursive: true });
+  await fs.writeFile(path.join(dir, '.hyperframes/artifacts/snapshots/x/a.png'), randomBytes(1000));
+  await fs.mkdir(path.join(dir, 'renders/work-0123abcd-xyz'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'renders/work-0123abcd-xyz/frame.jpg'), randomBytes(500));
+  await fs.writeFile(path.join(dir, 'renders/keep.mp4'), randomBytes(100));
+  const preview = JSON.parse(await call('project_cleanup', { project: name, scope: 'intermediate', dryRun: true }));
+  assert.deepEqual(preview.removed.map(item => item.path).sort(), ['.hyperframes/artifacts', 'renders/work-0123abcd-xyz']);
+  assert.equal(preview.totalBytes, 1500);
+  assert.ok(existsSync(path.join(dir, 'renders/work-0123abcd-xyz')));
+  await call('project_cleanup', { project: name, scope: 'intermediate' });
+  assert.ok(!existsSync(path.join(dir, '.hyperframes/artifacts')) && !existsSync(path.join(dir, 'renders/work-0123abcd-xyz')));
+  assert.ok(existsSync(path.join(dir, 'renders/keep.mp4')) && existsSync(path.join(dir, 'index.html')));
+  // An active render blocks deletion unless cancelRenders is set.
+  const job = JSON.parse(await call('hyperframes_render', { project: name, output: 'renders/busy.mp4', workers: 1, browserGpu: false }));
+  assert.match(await call('project_cleanup', { project: name }, true), /active render jobs/);
+  assert.ok(existsSync(dir));
+  const done = JSON.parse(await call('project_cleanup', { project: name, cancelRenders: true }));
+  assert.deepEqual(done.cancelledRenderJobs, [job.jobId]);
+  assert.ok(!existsSync(dir));
+  assert.equal((await http('GET', `/artifacts/${name}/renders/keep.mp4`)).status, 404);
+  assert.equal((await http('PUT', `/files/${name}/a.bin`, Buffer.from('x'))).status, 404);
+  assert.equal(JSON.parse(await call('hyperframes_render_list', { project: name })).jobs.length, 0);
+  await call('project_cleanup', { project: name }, true);
+  await call('project_cleanup', { project: '../etc' }, true);
+  assert.deepEqual(await fs.readdir(path.join(workspace, '.staging')), []);
+  check('project_cleanup: intermediate dry run + delete keeps sources/renders; active render blocks, cancelRenders deletes project and forgets jobs');
+}
 try {
   let health;
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -219,9 +251,9 @@ try {
   report.initialize = await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'hyperframes-smoke', version: '1' } });
   const { tools } = await rpc('tools/list', {});
   report.tools = tools.map(tool => tool.name);
-  assert.equal(tools.length, 24);
+  assert.equal(tools.length, 25);
   for (const name of ['hyperframes_check', 'hyperframes_snapshot', 'hyperframes_timeline', 'hyperframes_audio', 'hyperframes_version',
-    'hyperframes_render_status', 'hyperframes_render_cancel', 'hyperframes_render_list']) assert.ok(report.tools.includes(name));
+    'hyperframes_render_status', 'hyperframes_render_cancel', 'hyperframes_render_list', 'project_cleanup']) assert.ok(report.tools.includes(name));
   // workers must stay advertised as integer-or-string so clients can send "4" or "auto".
   const workersSchema = tools.find(tool => tool.name === 'hyperframes_render').inputSchema.properties.workers;
   assert.deepEqual(workersSchema.anyOf.map(item => item.type).sort(), ['integer', 'string'], JSON.stringify(workersSchema));
@@ -322,6 +354,7 @@ try {
   await call('hyperframes_cli', { command: 'cloud', args: [] }, true);
   // A failure from the real CLI must be marked as an MCP tool error.
   await call('hyperframes_cli', { project, command: 'render', args: ['--unsupported-upgrade-smoke-flag'] }, true);
+  await cleanupChecks(html);
   report.renderWorkDirsRemaining = (await fs.readdir(path.join(workspace, project, 'renders'))).filter(name => name.startsWith('work-'));
   assert.equal(report.renderWorkDirsRemaining.length, 0);
   report.systemTempRenderDirs = (await fs.readdir(tmpdir())).filter(name => name.startsWith('hf-render-'));
