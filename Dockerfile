@@ -6,7 +6,7 @@ ENV NODE_ENV=production \
     PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/hyperframes-chromium \
     HYPERFRAMES_BROWSER_PATH=/usr/local/bin/hyperframes-chromium \
     HF_WORKSPACE=/workspace/projects \
-    HYPERFRAMES_BIN=/usr/local/bin/hyperframes
+    HYPERFRAMES_BIN=/app/node_modules/.bin/hyperframes
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium ffmpeg unzip ca-certificates fonts-liberation fonts-noto-color-emoji \
@@ -33,17 +33,13 @@ RUN printf '%s\n' \
     > /usr/local/bin/hyperframes-chromium && \
     chmod +x /usr/local/bin/hyperframes-chromium
 
-RUN npm install -g hyperframes@0.8.33 && \
-    test -x /usr/local/bin/hyperframes && \
-    hyperframes --version
-
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && node_modules/.bin/hyperframes --version
 
 COPY src ./src
 COPY README.md ./README.md
 RUN mkdir -p /workspace/projects
 
-EXPOSE 10000
+EXPOSE 9006
 CMD ["node", "src/server.js"]

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for hyperframes-mcp installed in ~/work/tools/hyperframes-mcp (see README "Install").
+  Replace /Users/YOUR_USER before use; launchd does not expand "~".
+  The launcher reads hyperframes-mcp.env from its own directory and keeps projects in
+  .hyperframes-mcp/projects there. Put settings in that file rather than in this plist.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.hyperframes-mcp</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/hyperframes-mcp</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp</string>
+
+	<!-- The launcher runs the first `node` on PATH (or HYPERFRAMES_MCP_NODE); HyperFrames also
+	     needs `ffmpeg` and `ffprobe` on PATH. launchd starts with a minimal PATH, so list Homebrew's. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<!-- Graceful stop: SIGTERM stops running render jobs (their process groups) before exiting. -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<!-- Keep Interactive: renders are user-requested work. Background (and the unset default)
+	     throttle CPU and I/O for the server and every Chrome/FFmpeg process it starts. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+
+	<key>StandardOutPath</key>
+	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/service.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/service.log</string>
+</dict>
+</plist>

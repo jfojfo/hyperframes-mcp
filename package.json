@@ -1,21 +1,27 @@
 {
   "name": "hyperframes-mcp-server",
-  "version": "1.0.1",
+  "version": "1.6.0",
   "private": true,
   "description": "Remote MCP server that exposes HyperFrames video creation and rendering tools over Streamable HTTP.",
   "type": "module",
+  "bin": {
+    "hyperframes-mcp": "bin/hyperframes-mcp.js"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/server.js"
+    "check": "node --check src/server.js && node --check bin/hyperframes-mcp.js && node --check scripts/package.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "package": "node scripts/package.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
-    "hyperframes": "0.8.33",
+    "hyperframes": "0.9.43",
+    "tar": "7.5.23",
     "zod": "4.4.3"
   }
 }

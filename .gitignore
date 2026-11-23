@@ -1,4 +1,7 @@
+node_modules
 node_modules/
+node_modules_mac/
+node_modules_linux/
 .env
 .env.*
 !.env.example
@@ -9,3 +12,5 @@ renders/
 *.webm
 *.wav
 *.mp3
+.hyperframes-mcp/
+release/
