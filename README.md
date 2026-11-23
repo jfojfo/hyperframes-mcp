@@ -22,7 +22,9 @@ The MCP endpoint is:
 
 `http://localhost:9006/mcp` on this machine; LAN clients use `http://<this-machine-LAN-IP>:9006/mcp` (Streamable HTTP).
 
-The default listener is `0.0.0.0:9006`. All render work happens on the MCP host. No HeyGen login, official cloud render, or global HyperFrames installation is required. Chrome is auto-detected by HyperFrames, or set `PUPPETEER_EXECUTABLE_PATH` to your Chrome executable.
+The default listener is `0.0.0.0:9006`. All render work happens on the MCP host. No HeyGen login, official cloud render, or global HyperFrames installation is required.
+
+Browser selection, in order: `PUPPETEER_EXECUTABLE_PATH`, then `HYPERFRAMES_BROWSER_PATH`, then `/usr/local/bin/hyperframes-chromium` if that file exists (the wrapper the Docker image installs), otherwise HyperFrames auto-detects Chrome/Chromium. The chosen path is passed to the CLI as both variables. Every CLI call also runs with `CI=1`.
 
 The client must support plain HTTP LAN MCP endpoints; a cloud-hosted client cannot directly reach a private LAN IP.
 
@@ -33,7 +35,9 @@ Configuration:
 | `HOST` | `0.0.0.0` |
 | `PORT` | `9006` |
 | `HF_WORKSPACE` | `<install dir>/.hyperframes-mcp/projects` (see Install); `<this-repo>/.hyperframes-mcp/projects` in a source checkout |
-| `HYPERFRAMES_BIN` | First `node_modules/.bin/hyperframes` found walking up from the package directory |
+| `HYPERFRAMES_BIN` | `node_modules/.bin/hyperframes` of this package (`<repo>/node_modules/...`, or `<install dir>/app/node_modules/...`) |
+| `HYPERFRAMES_MCP_HOME` | Base directory for the default `HF_WORKSPACE`. Set by the installed launcher to the install directory; unset in a source checkout (repo root is used) |
+| `HYPERFRAMES_MCP_NODE` | Launcher only: Node.js executable to use instead of the first `node` on `PATH` |
 | `HF_COMMAND_TIMEOUT_MS` | `900000` (15 minutes per synchronous command; does not apply to `hyperframes_render` jobs) |
 | `HF_RENDER_TIMEOUT_MS` | `7200000` (2 hours per render job; the job is then stopped and marked failed) |
 | `HF_MAX_CONCURRENT_RENDERS` | `1` (render jobs running at once; later jobs queue) |
@@ -44,9 +48,13 @@ Configuration:
 | `HF_REQUEST_TIMEOUT_MS` | `3600000` (time allowed to receive one HTTP request, including upload body) |
 | `PUBLIC_BASE_URL` | Unset: download URLs use the request's `Host` / `X-Forwarded-*` headers. Set e.g. `https://hf.example.com` to force |
 
+Command-line flags (`bin/hyperframes-mcp.js`, also the installed launcher) set the same variables: `--host`, `-p/--port`, `-w/--workspace` (`~` is expanded), `--browser` (sets `PUPPETEER_EXECUTABLE_PATH`), `-v/--version`, `-h/--help`.
+
 Health check:
 
-`http://localhost:9006/health`
+`http://localhost:9006/health` returns `{ ok, service, version, hyperframesVersion, maxUploadBytes }`. `hyperframesVersion` is the declared dependency; call `hyperframes_version` for the CLI actually running. `GET /` prints a short summary of the routes.
+
+On startup the server creates `HF_WORKSPACE` and empties its `.staging/` subdirectory (temporary upload/archive/delete area; project names cannot start with `.`, so it is never a project).
 
 ## Install
 
@@ -95,7 +103,7 @@ Stopping sends SIGTERM: running render jobs are stopped and lost (jobs live in m
 
 ## Optional Render.com / Docker deployment
 
-This repo also includes `Dockerfile` and `render.yaml`. This hosts the same MCP server on Render.com; it is separate from the HyperFrames official cloud render service. For a LAN deployment, use the local instructions above. The container uses `/workspace/projects` and the same locked npm dependency as the local server.
+This repo also includes `Dockerfile` and `render.yaml`. This hosts the same MCP server on Render.com; it is separate from the HyperFrames official cloud render service. For a LAN deployment, use the local instructions above. The container uses `/workspace/projects` and the same locked npm dependency as the local server. The image installs Debian `chromium` and FFmpeg and wraps Chromium in `/usr/local/bin/hyperframes-chromium` (`--disable-dev-shm-usage --no-sandbox --disable-gpu --single-process …`) because Render provides only ~64 MB `/dev/shm`; the server picks this wrapper up automatically.
 
 1. In Render, create a **Web Service** from this GitHub repository.
 2. Select the Docker runtime (the Blueprint already specifies it).
@@ -117,33 +125,31 @@ Example:
 https://YOUR-SERVICE.onrender.com/mcp
 ```
 
-After connecting, Claude should discover tools such as:
+The server also sends MCP `instructions` describing the upload → render → poll → download → cleanup workflow, so clients learn it on connect.
 
-- `hyperframes_version`
-- `hyperframes_init`
-- `hyperframes_info`
-- `hyperframes_check` (preferred unified check)
-- `hyperframes_snapshot`
-- `hyperframes_timeline`
-- `hyperframes_audio` (local signal analysis)
-- `project_write_file`
-- `project_read_file`
-- `project_list_files`
-- `project_cleanup` (delete a finished project, or only its intermediate files)
-- `hyperframes_lint`
-- `hyperframes_validate`
-- `hyperframes_compositions`
-- `hyperframes_render` (submits a background job)
-- `hyperframes_render_status`
-- `hyperframes_render_cancel`
-- `hyperframes_render_list`
-- `hyperframes_transcribe`
-- `hyperframes_tts`
-- `hyperframes_catalog`
-- `hyperframes_add`
-- `hyperframes_docs`
-- `hyperframes_doctor`
-- `hyperframes_cli`
+After connecting, the client discovers 25 tools:
+
+| Tool | Purpose and notable parameters |
+| --- | --- |
+| `hyperframes_doctor` | Check HyperFrames, Node, FFmpeg and Chromium on the host. |
+| `hyperframes_version` | Version of the CLI actually running. |
+| `hyperframes_init` | Create a project (`name`, `example`, `resolution`, `fps`). Runs `init --non-interactive --skip-skills`; `fps` is written to the composition root's `data-fps` afterwards. Must be called before uploading. |
+| `hyperframes_info` / `hyperframes_lint` / `hyperframes_validate` / `hyperframes_compositions` | Project metadata (JSON), lint, legacy validation, composition IDs and durations. |
+| `hyperframes_check` | Preferred unified check (lint, runtime, layout, motion, contrast): `samples`, `at`, `range`, `components`, `atTransitions`, `strict`, `contrast`, `craft`, `cache`, `snapshots`, `timeout`, `budget`, `json`. |
+| `hyperframes_snapshot` | PNG key frames / review sheets: `frames`, `at`, `range`, `composition`, `review`, `end`, `keep`, `zoom`, `zoomScale`, `angle`, `against`, `json`, `timeout`. An explicit `output` must be a dedicated directory (not the project root, `index.html`, `assets`, `compositions`, `.hyperframes` …) because the CLI clears it. No AI vision service is called. |
+| `hyperframes_timeline` | Read tracks, clips and timing (read-only; edit through `hyperframes_cli`). |
+| `hyperframes_audio` | Local signal analysis of timing, loudness and silence, always `--quality fast`: `input`, `target`, `at`, `range`, `capabilities`, `json`. |
+| `hyperframes_render` | Submit a background render job, see [Render jobs](#render-jobs). |
+| `hyperframes_render_status` / `_cancel` / `_list` | Poll, cancel and list render jobs. |
+| `hyperframes_transcribe` | Local transcription (`engine`: `auto`/`whisper`/`parakeet`, `model`, `language`) or SRT/VTT/JSON import. May download models. |
+| `hyperframes_tts` | Local Kokoro voiceover (`text` ≤ 20 000 chars, `output`, `voice`, `speed`, `language`). May download the model. |
+| `hyperframes_catalog` / `hyperframes_add` | Search the registry / install a catalog item (needs internet). |
+| `hyperframes_docs` | CLI documentation for a topic. |
+| `project_write_file` / `project_read_file` / `project_list_files` | UTF-8 text files only (≤ 2 MB per write); binary reads are refused with a download URL. Listing skips `node_modules` and `.git` but includes renders and snapshots. |
+| `project_cleanup` | Delete a finished project, or only its intermediate files, see [Cleaning up](#cleaning-up-finished-projects). |
+| `hyperframes_cli` | Advanced, synchronous, with raw `args` (≤ 60). Allowed commands: `doctor init info lint validate check preview render compositions catalog add transcribe tts upgrade docs snapshot timeline audio normalize-audio beats inspect keyframes layout measure diff compare grade-compare media-treatment media-use remove-background capture history`. Cloud, publishing, sharing and account commands are excluded. |
+
+Project names must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$`. Every file path argument is project-relative and is rejected if it resolves (including through symlinks) outside the project.
 
 ## Files and render lifecycle
 
@@ -178,7 +184,7 @@ MCP tool calls carry text only: `project_write_file` / `project_read_file` handl
 | `POST /archives/<project>[/<dir>]` | Upload a `tar` or gzip-compressed `tar.gz` and extract it into the project or `<dir>`. Returns every written file with `size`, `sha256` and `url`. |
 | `GET` / `HEAD /artifacts/<project>/<file>` | Download. Supports single `Range` requests (`206` / `416`), `ETag` / `If-Range`, and UTF-8 filenames. |
 
-Optional request headers for uploads: `X-Content-SHA256: <hex>` rejects the upload with `422` if the received bytes differ, and `If-None-Match: *` refuses to overwrite existing files (`412`). Oversized uploads get `413`. Uploads are written to a temporary file and renamed into place, so a failed or rejected upload never leaves a partial file.
+Optional request headers for uploads: `X-Content-SHA256: <hex>` rejects the upload with `422` if the received bytes differ, and `If-None-Match: *` refuses to overwrite existing files (`412`). Oversized uploads get `413`; uploads to a project that does not exist get `404`; a wrong HTTP method gets `405`. Errors are returned as JSON `{ "error": ... }`. Uploads are written to a temporary file and renamed into place, so a failed or rejected upload never leaves a partial file.
 
 Archives are read with the bundled `tar` npm package, so behaviour is identical on Linux and macOS and no system `tar` is needed. They are checked before extraction and again after it. Only regular files and directories are accepted: symlinks, hard links, devices, absolute paths and `..` paths cause the whole archive to be rejected (`400`) with nothing written. Total extracted size and entry count are limited (`413`), checked from the headers before anything is written.
 
@@ -198,6 +204,19 @@ MCP clients usually time out a tool call after about a minute, while renders oft
 2. `hyperframes_render_status { jobId, waitSeconds?, logLines? }` returns `queued` (with `queuePosition`), `running` (with `progress` from the CLI's `@hf-progress` lines and `etaSeconds` when known), `succeeded` (with the CLI `output` and `artifacts`), `failed` (with `error` and a longer `logTail`) or `cancelled`. `waitSeconds` (0–30) blocks until the job finishes or the time runs out; keep it below the client's tool-call timeout.
 3. `hyperframes_render_cancel { jobId }` stops a queued or running job (SIGTERM to the whole process group, SIGKILL after 10 s).
 4. `hyperframes_render_list { project? }` lists jobs.
+
+`hyperframes_render` parameters (all optional except `project`; each maps to the CLI flag of the same name):
+
+| Group | Parameters |
+| --- | --- |
+| Output | `output`, `composition`, `format` (`mp4` `mov` `webm` `gif` `png-sequence` `hls`), `resolution`, `fps` (1–240, integer or fraction such as `"30000/1001"`), `start` / `end` (seconds) |
+| Quality | `quality` (`draft` `standard` `high` `looks` `delivery`), `crf` (0–51) **or** `videoBitrate`, `maxBitrate`, `bufferSize`, `keyframeInterval`, `proresProfile` (`proxy` `lt` `422` `hq` `4444`), `hdr` **or** `sdr`, `motionBlur: "off"`, `videoFrameFormat` (`auto` `jpg` `png`), `gifLoop`, `hlsSegmentSeconds` (1–60) |
+| Performance | `workers` (1–32 or `"auto"`), `gpu`, `browserGpu`, `docker`, `lowMemoryMode`, `framesCacheDir` (project-relative, or `off`/`none`/`false`/`0`) |
+| Variables / batch | `variables` (object, passed as JSON), `strictVariables`, `batch`, `batchConcurrency` (1–10), `batchFailFast` |
+| Diagnostics | `strict`, `strictAll`, `bestEffort`, `debug`, `json` |
+| Job | `waitSeconds` (0–30) |
+
+`output`, `composition`, `batch` and `framesCacheDir` must stay inside the project. A succeeded job lists the files it wrote: the explicit `output` (file or directory), otherwise files under `renders/` modified since the job started (at most 200 are listed; `truncated` gives the rest).
 
 `hyperframes_render` also accepts `waitSeconds`, so a short render can finish within the submitting call. Jobs run one at a time by default (`HF_MAX_CONCURRENT_RENDERS`). Job state lives in memory: a server restart stops running renders and forgets all jobs (rendered files stay in the project), and only the latest 200 finished jobs are kept. `hyperframes_cli` with `command: "render"` is still synchronous and subject to the client timeout.
 

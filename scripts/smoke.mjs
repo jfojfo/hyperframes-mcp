@@ -26,7 +26,8 @@ const child = spawn(process.execPath, ['src/server.js'], {
   cwd: root,
   env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), HF_WORKSPACE: workspace,
     HYPERFRAMES_NO_UPDATE_CHECK: '1', DO_NOT_TRACK: '1', HF_MAX_UPLOAD_BYTES: String(UPLOAD_LIMIT), HF_MAX_EXTRACT_BYTES: String(EXTRACT_LIMIT),
-    ...(process.platform === 'darwin' && !process.env.PUPPETEER_EXECUTABLE_PATH ? { PUPPETEER_EXECUTABLE_PATH: chrome } : {}),
+    // Only use the standard macOS Chrome location if it exists; otherwise HyperFrames auto-detects.
+    ...(process.platform === 'darwin' && !process.env.PUPPETEER_EXECUTABLE_PATH && existsSync(chrome) ? { PUPPETEER_EXECUTABLE_PATH: chrome } : {}),
   }, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';

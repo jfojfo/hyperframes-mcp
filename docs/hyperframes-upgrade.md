@@ -1,6 +1,8 @@
 # HyperFrames 0.8.33 → 0.9.43：能力、接口与本地部署
 
-核对日期：2026-11-13（美国东部时间）。目标是本机运行 MCP，局域网客户端通过 Streamable HTTP 调用，本机 Chromium/FFmpeg 完成渲染。
+核对日期：2026-11-13（美国东部时间）。
+
+> 本文是 0.9.43 升级当时的记录。之后的变更：渲染改为后台任务（`hyperframes_render` 返回 jobId，配合 `hyperframes_render_status` / `_cancel` / `_list`）；新增 HTTP 上传路由和 `project_cleanup`；默认项目目录改为 `<install dir>/.hyperframes-mcp/projects`（源码运行时为仓库根下的 `.hyperframes-mcp/projects`）。以 README 为准。目标是本机运行 MCP，局域网客户端通过 Streamable HTTP 调用，本机 Chromium/FFmpeg 完成渲染。
 
 ## 版本与依据
 
@@ -80,7 +82,7 @@ MCP 本身没有把项目打包上传到官方云，也没有每次创建临时�
 
 | 文件类别 | 当前本机路径/规则 | 生命周期 |
 | --- | --- | --- |
-| 项目源码与素材 | `/Users/YOUR_USER/work/tools/hyperframes-mcp/workspace/projects/<project>/` | 持续保留，多次调用复用 |
+| 项目源码与素材 | `HF_WORKSPACE/<project>/`（当时为 `<repo>/workspace/projects`，现默认 `<install dir>/.hyperframes-mcp/projects`） | 持续保留，多次调用复用 |
 | 默认成片 | 项目内 `renders/<project>_<日期>_<时间>.<ext>` | 持续保留；显式 output 可指定其他项目内路径 |
 | 截图 | 项目内 `.hyperframes/artifacts/snapshots/<unique-id>/` | 持续保留 |
 | 检查报告 | 项目内 `.hyperframes/artifacts/checks/` | 持续保留 |
@@ -92,22 +94,22 @@ MCP 本身没有把项目打包上传到官方云，也没有每次创建临时�
 本机实测渲染期间出现：
 
 ```text
-/var/folders/vv/c4rxspk153g_gsxwlzvl5k4c0000gn/T/hf-render-igvNHF
+$TMPDIR/hf-render-XXXXXX
 ```
 
 渲染结束后该目录已删除。正常清理逻辑不能保证在强制杀进程、主机崩溃、断电时执行。`debug`、成功任务的 `KEEP_TEMP=1`、分段恢复或缓存也可能有意保留数据。
 
 客户端机器不会因调用该 MCP 自动生成渲染目录；只有客户端主动下载时才在客户端保存文件。MCP 主机需要有所有引用素材的本地文件或可访问 URL，客户端的 `/Users/...` 或 `C:\\...` 路径不会被自动上传。
 
-当前 render 工具会等待 CLI 完成再返回，默认上限 15 分钟。没有后台任务队列、独立 job ID 查询或断线续接接口；上游内部的渲染进度目前缓存在子进程输出中，没有转发成 MCP 进度通知。长视频调用方需设置合适超时。
+（已过时，现为后台任务，见 README “Render jobs”）当时的 render 工具会等待 CLI 完成再返回，默认上限 15 分钟。没有后台任务队列、独立 job ID 查询或断线续接接口；上游内部的渲染进度目前缓存在子进程输出中，没有转发成 MCP 进度通知。长视频调用方需设置合适超时。
 
 ## 本机局域网服务
 
 已启动后台进程，监听 `0.0.0.0:9006`。当前本机局域网地址：
 
 ```text
-MCP:    http://<this-machine-LAN-IP>:9006/mcp
-health: http://<this-machine-LAN-IP>:9006/health
+MCP:    http://<LAN-IP>:9006/mcp
+health: http://<LAN-IP>:9006/health
 ```
 
 其他机器应使用支持 HTTP Streamable HTTP 的 MCP 客户端。运行在公网的云端客户端无法直接连接局域网地址。
@@ -156,6 +158,6 @@ workspace/verification/lan-report.json
 workspace/projects/lan-smoke/renders/lan-smoke.mp4
 ```
 
-最后一项额外通过本机的 `<this-machine-LAN-IP>` 地址发起 MCP 创建和渲染、完整解码及下载字节一致性检查，并观察到临时目录创建/删除。已确认监听所有 IPv4 网卡；尚未从第二台独立机器验证网络或主机防火墙通行。
+最后一项额外通过本机的 `<LAN-IP>` 地址发起 MCP 创建和渲染、完整解码及下载字节一致性检查，并观察到临时目录创建/删除。已确认监听所有 IPv4 网卡；尚未从第二台独立机器验证网络或主机防火墙通行。
 
 本次未实际执行语音识别模型推理、Kokoro 合成、去背景模型、所有 GIF/MOV/PNG 编码组合、批量变量任务或 Docker 构建，也没有更改登录启动项。doctor 显示本机 Chrome/FFmpeg/Whisper CLI 可用，Kokoro Python 运行时和 Docker 未安装；这些是可选能力边界，不影响已验证的本机 MP4/HLS 渲染。
