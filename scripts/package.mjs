@@ -95,7 +95,7 @@ const previous = path.join(out, '.app-old');
 fs.rmSync(staging, { recursive: true, force: true });
 fs.rmSync(previous, { recursive: true, force: true });
 fs.mkdirSync(staging);
-for (const entry of ['bin', 'src', 'package.json', 'package-lock.json', 'README.md']) {
+for (const entry of ['bin', 'src', 'package.json', 'package-lock.json', 'README.md', 'README.en.md']) {
   fs.cpSync(path.join(REPO, entry), path.join(staging, entry), { recursive: true });
 }
 run('npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: staging });

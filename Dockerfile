@@ -38,7 +38,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && node_modules/.bin/hyperframes --version
 
 COPY src ./src
-COPY README.md ./README.md
+COPY README.md README.en.md ./
 RUN mkdir -p /workspace/projects
 
 EXPOSE 9006
