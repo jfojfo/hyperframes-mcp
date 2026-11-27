@@ -5,6 +5,7 @@ node_modules_linux/
 .env
 .env.*
 !.env.example
+hyperframes-mcp.env
 workspace/
 renders/
 *.mp4

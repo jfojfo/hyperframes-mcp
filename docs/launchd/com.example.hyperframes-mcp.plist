@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent for hyperframes-mcp installed in ~/work/tools/hyperframes-mcp (see README "Install").
-  Replace /Users/YOUR_USER before use; launchd does not expand "~".
+  launchd agent for a packaged hyperframes-mcp installation.
+  Replace /path/to/hyperframes-mcp with the absolute installation directory.
+  Replace /path/to/tool-bin with the directories containing Node.js and FFmpeg, separated by colons.
   The launcher reads hyperframes-mcp.env from its own directory and keeps projects in
   .hyperframes-mcp/projects there. Put settings in that file rather than in this plist.
 -->
@@ -13,18 +14,17 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/hyperframes-mcp</string>
+		<string>/path/to/hyperframes-mcp/hyperframes-mcp</string>
 	</array>
 
 	<key>WorkingDirectory</key>
-	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp</string>
+	<string>/path/to/hyperframes-mcp</string>
 
-	<!-- The launcher runs the first `node` on PATH (or HYPERFRAMES_MCP_NODE); HyperFrames also
-	     needs `ffmpeg` and `ffprobe` on PATH. launchd starts with a minimal PATH, so list Homebrew's. -->
+	<!-- Include the directories for node, ffmpeg, and ffprobe on PATH. -->
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<string>/path/to/tool-bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 
 	<key>RunAtLoad</key>
@@ -43,8 +43,8 @@
 	<string>Interactive</string>
 
 	<key>StandardOutPath</key>
-	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/service.log</string>
+	<string>/path/to/hyperframes-mcp/service.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/YOUR_USER/work/tools/hyperframes-mcp/service.log</string>
+	<string>/path/to/hyperframes-mcp/service.log</string>
 </dict>
 </plist>

@@ -65,14 +65,14 @@ On startup the server creates `HF_WORKSPACE` and empties its `.staging/` subdire
 ```bash
 cd hyperframes-mcp            # source checkout
 npm ci
-npm run package -- --out=~/work/tools/hyperframes-mcp
-~/work/tools/hyperframes-mcp/hyperframes-mcp --version
+npm run package -- --out="$HOME/.local/share/hyperframes-mcp"
+"$HOME/.local/share/hyperframes-mcp/hyperframes-mcp" --version
 ```
 
 It copies `bin/`, `src/` and the lockfile into `<out>/app/`, installs production dependencies there with `npm ci`, and writes the launcher `hyperframes-mcp` and a reference `hyperframes-mcp.env.example`.
 
 ```text
-~/work/tools/hyperframes-mcp/
+~/.local/share/hyperframes-mcp/
 ├── hyperframes-mcp                launcher (launchd points here)
 ├── hyperframes-mcp.env            your settings (optional; copy from the example)
 ├── hyperframes-mcp.env.example    reference settings (replaced on upgrade)
@@ -87,7 +87,9 @@ It copies `bin/`, `src/` and the lockfile into `<out>/app/`, installs production
 
 ### Background service on macOS (launchd)
 
-Template: [`docs/launchd/com.example.hyperframes-mcp.plist`](docs/launchd/com.example.hyperframes-mcp.plist). launchd does not expand `~`: replace `/Users/YOUR_USER` with your home path. `PATH` in the template must contain `node`, `ffmpeg` and `ffprobe` (`which node ffmpeg`). Keep `ProcessType` = `Interactive`; `Background` or unset lets macOS throttle CPU and I/O for the server and its Chrome/FFmpeg processes. Set the browser in `hyperframes-mcp.env`, e.g. `PUPPETEER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
+Copy the [launchd template](docs/launchd/com.example.hyperframes-mcp.plist) and replace `/path/to/hyperframes-mcp` with the absolute directory passed to `--out`. Use `command -v node ffmpeg ffprobe` to find the tools, then replace `/path/to/tool-bin` with their directories separated by colons. Keep `ProcessType` set to `Interactive`. With `Background` or the default, macOS can throttle CPU and I/O for the server and its Chrome/FFmpeg processes.
+
+To select a browser manually, set its path in `hyperframes-mcp.env`, for example `PUPPETEER_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`.
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
@@ -97,7 +99,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hyperframes-
 launchctl print gui/$(id -u)/com.example.hyperframes-mcp | head -20                          # status
 launchctl kickstart -k gui/$(id -u)/com.example.hyperframes-mcp                              # restart (e.g. after upgrade)
 launchctl bootout gui/$(id -u)/com.example.hyperframes-mcp                                   # stop and disable
-tail -f ~/work/tools/hyperframes-mcp/service.log                                             # log
+tail -f "$HOME/.local/share/hyperframes-mcp/service.log"                                     # log in the example install directory
 curl --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:9006/health             # wait until ready
 ```
 

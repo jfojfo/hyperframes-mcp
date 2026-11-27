@@ -61,14 +61,14 @@ npm start
 ```bash
 cd hyperframes-mcp            # 进入源码目录
 npm ci
-npm run package -- --out=~/work/tools/hyperframes-mcp
-~/work/tools/hyperframes-mcp/hyperframes-mcp --version
+npm run package -- --out="$HOME/.local/share/hyperframes-mcp"
+"$HOME/.local/share/hyperframes-mcp/hyperframes-mcp" --version
 ```
 
 打包脚本将 `bin/`、`src/`、包清单、锁文件和两份 README 复制到 `<out>/app/`，在该目录执行 `npm ci` 安装生产依赖，再生成启动器 `hyperframes-mcp` 和配置示例 `hyperframes-mcp.env.example`。
 
 ```text
-~/work/tools/hyperframes-mcp/
+~/.local/share/hyperframes-mcp/
 ├── hyperframes-mcp                启动器，供 launchd 调用
 ├── hyperframes-mcp.env            可选配置，从示例复制
 ├── hyperframes-mcp.env.example    配置示例，升级时覆盖
@@ -83,9 +83,9 @@ npm run package -- --out=~/work/tools/hyperframes-mcp
 
 ### 在 macOS 上通过 launchd 后台运行
 
-使用 [launchd 配置模板](docs/launchd/com.example.hyperframes-mcp.plist)。launchd 不会展开 `~`，请将 `/Users/YOUR_USER` 改为实际用户目录。模板里的 `PATH` 必须包含 `node`、`ffmpeg` 和 `ffprobe` 所在目录，可以用 `which node ffmpeg` 查看路径。将 `ProcessType` 保持为 `Interactive`。`Background` 或未设置时，macOS 可能限制服务器及其 Chrome、FFmpeg 进程使用 CPU 和磁盘。
+使用 [launchd 配置模板](docs/launchd/com.example.hyperframes-mcp.plist)。复制模板后，将 `/path/to/hyperframes-mcp` 替换为 `--out` 指定的绝对安装目录。运行 `command -v node ffmpeg ffprobe` 查找工具，将 `/path/to/tool-bin` 替换为这些工具所在的目录，多个目录用冒号分隔。将 `ProcessType` 保持为 `Interactive`。`Background` 或未设置时，macOS 可能限制服务器及其 Chrome、FFmpeg 进程使用 CPU 和磁盘。
 
-在 `hyperframes-mcp.env` 里设置浏览器路径，例如 `PUPPETEER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`。
+如果需要手动指定浏览器，在 `hyperframes-mcp.env` 里设置实际路径，例如 `PUPPETEER_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`。
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
@@ -95,7 +95,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hyperframes-
 launchctl print gui/$(id -u)/com.example.hyperframes-mcp | head -20                          # 查看状态
 launchctl kickstart -k gui/$(id -u)/com.example.hyperframes-mcp                              # 重启，例如升级后
 launchctl bootout gui/$(id -u)/com.example.hyperframes-mcp                                   # 停止并卸载任务
-tail -f ~/work/tools/hyperframes-mcp/service.log                                             # 查看日志
+tail -f "$HOME/.local/share/hyperframes-mcp/service.log"                                     # 查看示例安装目录下的日志
 curl --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:9006/health             # 等待服务就绪
 ```
 

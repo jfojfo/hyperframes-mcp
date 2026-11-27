@@ -2,7 +2,7 @@
 /**
  * Packages the server into a self-contained install directory, separate from the source:
  *
- *   npm run package -- --out=~/work/tools/hyperframes-mcp
+ *   npm run package -- --out="$HOME/.local/share/hyperframes-mcp"
  *
  *   <out>/hyperframes-mcp              launcher (run this; launchd points here)
  *   <out>/app/                         bin/, src/, package.json, production node_modules
