@@ -75,6 +75,50 @@ async function http(method, file, body, headers = {}) {
   return { status: response.status, headers: response.headers, body: Buffer.from(await response.arrayBuffer()) };
 }
 function check(name) { report.checks.push(name); console.log(`PASS ${name}`); }
+const parseJsonOutput = text => JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+// The guide topics are what MCP clients learn the HTML rules from: they must be advertised, served verbatim,
+// and their example project must pass check and render visible frames (needs the GSAP CDN, like real projects).
+async function guideChecks() {
+  assert.match(report.initialize.instructions, /hyperframes_docs with topic "contract"/);
+  const guide = topic => fs.readFile(path.join(root, 'src/guide', `${topic}.md`), 'utf8');
+  const contract = await guide('contract');
+  assert.equal(await call('hyperframes_docs', { topic: 'contract' }), contract);
+  assert.equal(await call('hyperframes_docs', { topic: ' Workflow ' }), await guide('workflow'));
+  assert.match(await call('hyperframes_docs', { topic: 'gsap' }), /__timelines/);
+  assert.match(await call('hyperframes_docs', { topic: 'no-such-topic' }, true), /data-attributes[\s\S]*Topics served by this MCP server: contract, workflow/);
+  check('guide topics advertised in instructions and served by hyperframes_docs');
+
+  const example = `${project}-guide`;
+  const [body, intro] = [...contract.matchAll(/```html\n([\s\S]*?)```/g)].map(match => match[1]);
+  assert.ok(body?.includes('<body>') && intro?.includes('<template>'), 'contract.md lost its example blocks');
+  await call('hyperframes_init', { name: example });
+  const scaffold = await call('project_read_file', { project: example, file: 'index.html' });
+  await call('project_write_file', { project: example, file: 'index.html', content: scaffold.replace(/<body>[\s\S]*<\/body>/, body.trim()) });
+  await call('project_write_file', { project: example, file: 'compositions/intro.html', content: intro });
+  await call('project_write_file', { project: example, file: 'compositions/outro.html', content: intro.replaceAll('intro', 'outro') });
+  assert.equal(parseJsonOutput(await call('hyperframes_lint', { project: example, json: true })).errorCount, 0);
+  const checked = parseJsonOutput(await call('hyperframes_check', { project: example, json: true }));
+  assert.ok(checked.ok, JSON.stringify(checked, null, 2));
+  // The example is what clients copy: it must not teach a warning either (e.g. first_frame_empty).
+  const warnings = Object.values(checked).flatMap(section => section?.findings ?? []).filter(item => item.severity !== 'info');
+  assert.deepEqual(warnings, [], JSON.stringify(warnings, null, 2));
+  // Map snapshot paths to artifact URLs the way topic "workflow" tells clients to.
+  const shots = parseJsonOutput(await call('hyperframes_snapshot', { project: example, at: [1.5, 4.5], json: true }));
+  const projectDir = await fs.realpath(path.join(workspace, example)) + path.sep;
+  const picked = shots.frames.filter(item => [1.5, 4.5].includes(item.time));
+  assert.equal(picked.length, 2, JSON.stringify(shots.frames));
+  for (const frame of picked) {
+    assert.ok(frame.path.startsWith(projectDir + '.hyperframes/artifacts/snapshots/'), frame.path);
+    const response = await fetch(`${base}/artifacts/${example}/${frame.path.slice(projectDir.length)}`);
+    assert.equal(response.status, 200);
+    // A mounted scene draws a large white title on the dark ground; a scene that failed to mount is blank.
+    const gray = execFileSync('ffmpeg', ['-v', 'error', '-i', 'pipe:0', '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+      { input: Buffer.from(await response.arrayBuffer()), maxBuffer: 64 * 1024 * 1024 });
+    assert.ok(gray.filter(value => value > 200).length > 5000, `frame at ${frame.time}s shows no title`);
+  }
+  await call('project_cleanup', { project: example });
+  check('contract example passes lint and check, and snapshots download via the documented artifact path');
+}
 async function binaryTransferChecks() {
   const dir = path.join(workspace, project);
   // Every byte value, so any text/encoding mangling shows up.
@@ -259,6 +303,7 @@ try {
   const workersSchema = tools.find(tool => tool.name === 'hyperframes_render').inputSchema.properties.workers;
   assert.deepEqual(workersSchema.anyOf.map(item => item.type).sort(), ['integer', 'string'], JSON.stringify(workersSchema));
   assert.equal((await call('hyperframes_version')).trim(), '0.9.43');
+  await guideChecks();
   await call('hyperframes_init', { name: project, fps: 24 });
   assert.match(await fs.readFile(path.join(workspace, project, 'index.html'), 'utf8'), /data-fps="24"/);
   await binaryTransferChecks();

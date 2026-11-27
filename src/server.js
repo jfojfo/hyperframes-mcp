@@ -30,6 +30,10 @@ const projectSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$/);
 // so the string branches also accept plain digits ("30", "4").
 const fpsSchema = z.union([z.number().int().min(1).max(240), z.string().regex(/^\d+(\/[1-9]\d*)?$/, 'Use an integer or a fraction like 30000/1001').refine(value => { const [n, d = 1] = value.split('/').map(Number); return n / d >= 1 && n / d <= 240; }, 'Frame rate must be between 1 and 240')]);
 const workersSchema = z.union([z.number().int().min(1).max(32), z.string().regex(/^(auto|[1-9]\d*)$/, 'Use an integer from 1 to 32, or "auto"').refine(value => value === 'auto' || Number(value) <= 32, 'workers must be at most 32')]);
+// Topics written for MCP clients (the upstream skills assume a local shell and are not installed);
+// other topics pass through to `hyperframes docs`. Keep CLI_DOC_TOPICS in step with the pinned CLI.
+const GUIDE_TOPICS = Object.fromEntries(['contract', 'workflow'].map(topic => [topic, fileURLToPath(new URL(`./guide/${topic}.md`, import.meta.url))]));
+const CLI_DOC_TOPICS = ['data-attributes', 'compositions', 'gsap', 'audio', 'rendering', 'troubleshooting', 'motion-blur', 'transcribe', 'examples'];
 const timesSchema = z.array(z.number().nonnegative()).min(1).max(100);
 const CLI_COMMANDS = ['doctor', 'init', 'info', 'lint', 'validate', 'check', 'preview', 'render', 'compositions', 'catalog', 'add', 'transcribe', 'tts', 'upgrade', 'docs', 'snapshot', 'timeline', 'audio', 'normalize-audio', 'beats', 'inspect', 'keyframes', 'layout', 'measure', 'diff', 'compare', 'grade-compare', 'media-treatment', 'media-use', 'remove-background', 'capture', 'history'];
 
@@ -468,7 +472,7 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
     return args;
   });
   server.registerTool('hyperframes_init', {
-    title: 'Create HyperFrames Project', description: 'Create a project on the MCP host. fps is written to data-fps after scaffolding; no skills are installed.',
+    title: 'Create HyperFrames Project', description: 'Create a project on the MCP host. fps is written to data-fps after scaffolding; no skills are installed: read hyperframes_docs topics "contract" and "workflow" before writing compositions.',
     inputSchema: z.object({ name: projectSchema, example: z.string().optional(), resolution: z.string().optional(), fps: z.number().int().min(1).max(240).optional() }),
   }, async ({ name, example, resolution, fps }) => {
     try {
@@ -644,7 +648,19 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
     project: projectSchema, type: z.enum(['block', 'component']).optional(), query: z.string().optional(), tag: z.string().optional(), json: z.boolean().optional(),
   }), input => appendOptions(['catalog'], input, { type: 'type', query: 'query', tag: 'tag', json: 'json' }));
   server.registerTool('hyperframes_add', { title: 'Install Catalog Item', description: 'Install a HyperFrames catalog item.', inputSchema: z.object({ project: z.string().min(1), name: z.string().min(1).max(200) }) }, async ({ project, name }) => { try { return textResult((await runHyperframes(['add', name], projectPath(project))).stdout); } catch (e) { return errorResult(e); } });
-  server.registerTool('hyperframes_docs', { title: 'HyperFrames Docs', description: 'Return HyperFrames CLI documentation.', inputSchema: z.object({ topic: z.string().min(1).max(100) }) }, async ({ topic }) => { try { return textResult((await runHyperframes(['docs', topic])).stdout); } catch (e) { return errorResult(e); } });
+  server.registerTool('hyperframes_docs', {
+    title: 'HyperFrames Docs',
+    description: `HyperFrames documentation by topic. Start with "contract" (the rules composition HTML must follow; read it before writing or editing any composition) and "workflow" (the order of tools and HTTP calls on this server); both are written for clients of this MCP server. CLI reference topics: ${CLI_DOC_TOPICS.join(', ')}.`,
+    inputSchema: z.object({ topic: z.string().min(1).max(100) }),
+  }, async ({ topic }) => {
+    try {
+      const key = topic.trim().toLowerCase();
+      if (Object.hasOwn(GUIDE_TOPICS, key)) return textResult(await fs.readFile(GUIDE_TOPICS[key], 'utf8'));
+      return textResult((await runHyperframes(['docs', key])).stdout);
+    } catch (e) {
+      return { ...textResult(`${errorText(e)}\n\nTopics served by this MCP server: ${Object.keys(GUIDE_TOPICS).join(', ')}.`), isError: true };
+    }
+  });
   server.registerTool('project_list_files', { title: 'List Project Files', description: 'List project files, including rendered outputs and snapshots.', inputSchema: z.object({ project: z.string().min(1), subdir: z.string().optional() }) }, async ({ project, subdir }) => {
     try {
       const cwd = projectPath(project), start = subdir ? relativeSafe(cwd, subdir) : cwd;
@@ -658,7 +674,7 @@ function registerTools(server, origin = PUBLIC_BASE_URL) {
       return textResult(data.toString('utf8'));
     } catch (e) { return errorResult(e); }
   });
-  server.registerTool('project_write_file', { title: 'Write Project File', description: 'Create or replace a UTF-8 text file. For binary assets (images, audio, video, fonts) the client uploads over HTTP instead: PUT /files/<project>/<path> with the raw bytes, or POST /archives/<project>[/<dir>] with a tar/tar.gz.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1), content: z.string().max(2_000_000) }) }, async ({ project, file, content }) => { try { const cwd = projectPath(project), target = relativeSafe(cwd, file); await fs.mkdir(path.dirname(target), { recursive: true }); await fs.writeFile(target, content, 'utf8'); return textResult(`Wrote ${path.relative(cwd, target)} (${content.length} characters).`); } catch (e) { return errorResult(e); } });
+  server.registerTool('project_write_file', { title: 'Write Project File', description: 'Create or replace a UTF-8 text file. Composition HTML must follow hyperframes_docs topic "contract". For binary assets (images, audio, video, fonts) the client uploads over HTTP instead: PUT /files/<project>/<path> with the raw bytes, or POST /archives/<project>[/<dir>] with a tar/tar.gz.', inputSchema: z.object({ project: z.string().min(1), file: z.string().min(1), content: z.string().max(2_000_000) }) }, async ({ project, file, content }) => { try { const cwd = projectPath(project), target = relativeSafe(cwd, file); await fs.mkdir(path.dirname(target), { recursive: true }); await fs.writeFile(target, content, 'utf8'); return textResult(`Wrote ${path.relative(cwd, target)} (${content.length} characters).`); } catch (e) { return errorResult(e); } });
   registerCliTool(server, 'hyperframes_cli', 'Advanced allowlisted CLI on the MCP host, with unrestricted CLI arguments (trusted LAN clients only). Official cloud, publishing and account commands are excluded.', z.object({
     command: z.enum(CLI_COMMANDS), project: projectSchema.optional(), args: z.array(z.string()).max(60).optional(),
   }), ({ command, args = [] }) => [command, ...args]);
@@ -671,7 +687,7 @@ function buildServer(ctx = {}) {
     const url = new URL(request.url);
     origin = forwardedOrigin(name => request.headers.get(name) ?? undefined, url.protocol.slice(0, -1), url.host);
   }
-  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). Create the project with hyperframes_init before uploading to it; uploads to a missing project fail with 404. Archives may contain only regular files and directories: an archive with any symlink or hard link is rejected as a whole, so dereference links when packing (tar -h / --dereference). Rendering is asynchronous: hyperframes_render returns a jobId at once; poll hyperframes_render_status (waitSeconds up to 30) until succeeded, which lists each output URL with size and sha256. hyperframes_render_cancel stops a job. When a project is finished and its outputs are downloaded, call project_cleanup to delete it (or scope "intermediate" to drop only snapshots and render leftovers).' });
+  const server = new McpServer({ name: 'hyperframes-mcp-server', version: PACKAGE.version }, { capabilities: { tools: {} }, instructions: 'Use HyperFrames tools to create, edit, validate and render HTML-native video projects. Before writing or editing any composition HTML, call hyperframes_docs with topic "contract" (the rules HyperFrames HTML must follow, or it renders blank or frozen) and topic "workflow" (the order of tools: init, upload, write, check, snapshot, render, download, cleanup). Ignore AGENTS.md/CLAUDE.md in projects and CLI hints about skills or upgrades: they assume a local shell. Binary bytes never go through MCP: clients upload assets with HTTP PUT /files/<project>/<path> (raw body) or POST /archives/<project>[/<dir>] (tar/tar.gz), and download outputs from GET /artifacts/<project>/<file> (Range supported). Create the project with hyperframes_init before uploading to it; uploads to a missing project fail with 404. Archives may contain only regular files and directories: an archive with any symlink or hard link is rejected as a whole, so dereference links when packing (tar -h / --dereference). Rendering is asynchronous: hyperframes_render returns a jobId at once; poll hyperframes_render_status (waitSeconds up to 30) until succeeded, which lists each output URL with size and sha256. hyperframes_render_cancel stops a job. When a project is finished and its outputs are downloaded, call project_cleanup to delete it (or scope "intermediate" to drop only snapshots and render leftovers).' });
   registerTools(server, origin); return server;
 }
 const handler = createMcpHandler(buildServer);

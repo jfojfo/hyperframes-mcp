@@ -161,3 +161,11 @@ workspace/projects/lan-smoke/renders/lan-smoke.mp4
 最后一项额外通过本机的 `<LAN-IP>` 地址发起 MCP 创建和渲染、完整解码及下载字节一致性检查，并观察到临时目录创建/删除。已确认监听所有 IPv4 网卡；尚未从第二台独立机器验证网络或主机防火墙通行。
 
 本次未实际执行语音识别模型推理、Kokoro 合成、去背景模型、所有 GIF/MOV/PNG 编码组合、批量变量任务或 Docker 构建，也没有更改登录启动项。doctor 显示本机 Chrome/FFmpeg/Whisper CLI 可用，Kokoro Python 运行时和 Docker 未安装；这些是可选能力边界，不影响已验证的本机 MP4/HLS 渲染。
+
+## 后续升级：同步客户端指南
+
+服务器以 `--skip-skills` 初始化项目，上游 skills 不会到达 MCP 调用方；调用方通过 `hyperframes_docs` 的 `contract` 和 `workflow` 两个 topic 获取创作规则和工具顺序，内容在 `src/guide/`，按 0.9.43 的上游 skills 改写。升级 HyperFrames 后：
+
+1. 对比新版 `node_modules/hyperframes/dist/skills/hyperframes/SKILL.md`（Contract、Work loop）、`references/format.md` 和 `hyperframes-cli/SKILL.md`，把变化同步到 `src/guide/*.md`，命令改写为对应的 MCP 工具，并更新文中的版本号。
+2. 运行 `hyperframes docs <任意未知 topic>` 查看 CLI 当前 topic 列表，同步 `src/server.js` 中的 `CLI_DOC_TOPICS`。
+3. 运行 `npm run smoke`：它会把 contract 中的示例写成项目，要求 lint 和 check 通过，并确认截图里场景已挂载。

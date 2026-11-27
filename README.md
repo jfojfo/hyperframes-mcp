@@ -127,6 +127,15 @@ https://YOUR-SERVICE.onrender.com/mcp
 
 The server also sends MCP `instructions` describing the upload → render → poll → download → cleanup workflow, so clients learn it on connect.
 
+### Composition guide for clients
+
+`hyperframes init` runs with `--skip-skills`, so the upstream HyperFrames agent skills (which assume a local shell and `npx`) never reach MCP clients. Instead, `hyperframes_docs` serves two topics written for clients of this server from [`src/guide/`](src/guide/):
+
+- `contract`: the rules composition HTML must follow (timed clips, timeline registration, determinism, scene `<template>` files, matching ids, fonts, asset paths), with a minimal two-scene example.
+- `workflow`: the order of tools and HTTP calls, from `hyperframes_init` through upload, write, check, snapshot, render, download and `project_cleanup`.
+
+The MCP `instructions` and the `hyperframes_init` / `project_write_file` descriptions tell clients to read both before writing compositions. Other topics pass through to `hyperframes docs`. When upgrading HyperFrames, compare the guide with the new upstream skills in `node_modules/hyperframes/dist/skills/` (`hyperframes`, `hyperframes-cli`) and update `CLI_DOC_TOPICS` in `src/server.js`; `npm run smoke` checks that the contract's example still passes `check`.
+
 After connecting, the client discovers 25 tools:
 
 | Tool | Purpose and notable parameters |
@@ -144,7 +153,7 @@ After connecting, the client discovers 25 tools:
 | `hyperframes_transcribe` | Local transcription (`engine`: `auto`/`whisper`/`parakeet`, `model`, `language`) or SRT/VTT/JSON import. May download models. |
 | `hyperframes_tts` | Local Kokoro voiceover (`text` ≤ 20 000 chars, `output`, `voice`, `speed`, `language`). May download the model. |
 | `hyperframes_catalog` / `hyperframes_add` | Search the registry / install a catalog item (needs internet). |
-| `hyperframes_docs` | CLI documentation for a topic. |
+| `hyperframes_docs` | `contract` and `workflow` (see [Composition guide for clients](#composition-guide-for-clients)), or a CLI documentation topic. |
 | `project_write_file` / `project_read_file` / `project_list_files` | UTF-8 text files only (≤ 2 MB per write); binary reads are refused with a download URL. Listing skips `node_modules` and `.git` but includes renders and snapshots. |
 | `project_cleanup` | Delete a finished project, or only its intermediate files, see [Cleaning up](#cleaning-up-finished-projects). |
 | `hyperframes_cli` | Advanced, synchronous, with raw `args` (≤ 60). Allowed commands: `doctor init info lint validate check preview render compositions catalog add transcribe tts upgrade docs snapshot timeline audio normalize-audio beats inspect keyframes layout measure diff compare grade-compare media-treatment media-use remove-background capture history`. Cloud, publishing, sharing and account commands are excluded. |
@@ -231,7 +240,7 @@ npm run check
 npm run smoke
 ```
 
-The smoke check starts an isolated loopback server and exercises real HTTP MCP calls, project creation, lint/check, snapshots, timeline, MP4 and HLS render jobs (submit, status polling, cancel, list), full FFmpeg decode, artifact download, binary upload/archive/Range/symlink-escape checks, local audio analysis, transcript import, and error handling. It preserves media and reports in `workspace/verification/`. Chrome and FFmpeg must be installed. Speech/TTS model downloads are not part of the smoke check.
+The smoke check starts an isolated loopback server and exercises real HTTP MCP calls, project creation, lint/check, snapshots, timeline, MP4 and HLS render jobs (submit, status polling, cancel, list), full FFmpeg decode, artifact download, binary upload/archive/Range/symlink-escape checks, local audio analysis, transcript import, the guide topics (served verbatim; the contract's example project passes lint and check and its snapshots show the mounted scenes), and error handling. It preserves media and reports in `workspace/verification/`. Chrome and FFmpeg must be installed. Speech/TTS model downloads are not part of the smoke check.
 
 See [the version comparison and verification notes](docs/hyperframes-upgrade.md) for the upgrade scope and limits.
 
